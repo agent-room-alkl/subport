@@ -49,12 +49,18 @@ type Store struct {
 // base must be the address this process is actually reachable on, because the
 // demo upstream is served by this same process. Hardcoding a port here breaks
 // the gateway silently whenever the server runs anywhere else.
+// Every seeded account uses Provider "mock" because they all point at this
+// process's own demo upstream. Naming them "openai" would route them through
+// the real OpenAI adapter, which would call /v1/chat/completions on a server
+// that only serves /mock/upstream - the demo would break with a confusing
+// "no healthy account". A real account gets Provider "openai" AND a real
+// BaseURL together; the two must never be set apart.
 func seedAccounts(base string) []model.Account {
 	return []model.Account{
-		{ID: "acct-openai-1", Name: "OpenAI primary", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
-		{ID: "acct-openai-2", Name: "OpenAI sibling", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
-		{ID: "acct-anthropic-1", Name: "Anthropic backup", Provider: "anthropic", BaseURL: base, Priority: 2, Healthy: true},
-		{ID: "acct-stream-break", Name: "Stream-break demo", Provider: "openai", BaseURL: base, Priority: 3, Healthy: false},
+		{ID: "acct-openai-1", Name: "OpenAI primary (demo)", Provider: "mock", BaseURL: base, Priority: 1, Healthy: true},
+		{ID: "acct-openai-2", Name: "OpenAI sibling (demo)", Provider: "mock", BaseURL: base, Priority: 1, Healthy: true},
+		{ID: "acct-anthropic-1", Name: "Anthropic backup (demo)", Provider: "mock", BaseURL: base, Priority: 2, Healthy: true},
+		{ID: "acct-stream-break", Name: "Stream-break demo", Provider: "mock", BaseURL: base, Priority: 3, Healthy: false},
 	}
 }
 

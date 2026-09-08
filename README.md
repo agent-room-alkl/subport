@@ -157,10 +157,32 @@ admin 访问 /api/accounts -> 200
 每次调用都会写一条 `usage_log`，归属到**密钥的所有者**——用户 id 来自密钥，
 不来自请求。失败不计费但仍记录；断流按已产出计费并标记 `stream_broken`，可申诉。
 
+## 接上游供应商
+
+上游走**适配器**，按账号的 `provider` 字段选：
+
+| provider | 说明 |
+|---|---|
+| `mock` | 自带假上游，**默认种子账号全是它**。保留它做回归基线 |
+| `openai` | OpenAI 兼容：`POST {BaseURL}/v1/chat/completions` + `Authorization: Bearer`，并读取上游返回的真实 `usage.total_tokens` |
+
+未知 provider **直接报错，不会退回 mock**——否则它看起来在工作，实际什么都没连。
+
+凭据只从环境变量读，**不入库、不出现在任何 API 响应里**：
+
+| 变量 | 说明 |
+|---|---|
+| `SUBPORT_PROVIDER_KEY` | 所有供应商共用的默认密钥 |
+| `SUBPORT_PROVIDER_KEY_<PROVIDER>` | 按供应商覆盖，例如 `SUBPORT_PROVIDER_KEY_OPENAI`。优先于上面那个 |
+
+接一个真实账号，`provider` 和 `base_url` **必须同时设对**：种子账号叫 "OpenAI primary (demo)" 但 `provider=mock`，因为它们指向的是本进程的假上游。把 provider 改成 `openai` 却不改 base_url，请求就会去假上游要 `/v1/chat/completions`，然后整条链路以 "no healthy account" 失败——这个坑我们已经踩过一次了。
+
+Anthropic 的 `/v1/messages` + `x-api-key` 形状不同，还没写适配器；加它只需要新增一个 provider 实现，不用动调度器。
+
 ## 已知边界（诚实清单）
 
 - **上游是模拟的。** `/mock/upstream` 是自带的假上游，还没接真实模型供应商。`callUpstream` 已经是真实 HTTP 调用，换掉 BaseURL 就能接真的。
-- **计费按响应字符数估算**，不是真实 token 数。接上真实上游后应改用上游返回的 usage。
+- **计费优先用上游返回的 usage**；上游没给才退回按响应字符数估算。注意 0 被当作「未知」而不是「免费」，否则不报 usage 的供应商会导致完全不计费。
 - **存储是 SQLite**（`modernc.org/sqlite`，纯 Go 无需 CGO），只有这一条写入路径。早先的 JSON 双写已经拆掉——两个写者两份状态、没有东西保证它们相等，正是存储层该防的事。`Store` 是接口层：换 SQLite 时 `gateway/` 和 `httpapi/` 一行都没动，换 Postgres 同理。
 - **单机 SQLite，还不是多实例。** 事务和并发有了，但多进程共享同一个文件仍不合适；要横向扩就得换 Postgres。
 - **密码哈希是 SHA-256 加盐，不是 bcrypt/argon2。** 标准库能做到的上限。上线前应换成 argon2id。

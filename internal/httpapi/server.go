@@ -171,7 +171,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Billed against the owner resolved from the key, never from the request.
-	tokens := int64(len(res.Text))
+	// Prefer the provider's own usage count; fall back to response length only
+	// when the provider reported none, since a 0 there means "unknown", not
+	// "free" - billing nothing for every call would be the silent failure.
+	tokens := res.Tokens
+	if tokens <= 0 {
+		tokens = int64(len(res.Text))
+	}
 	_ = s.Store.AddUsage(model.UsageLog{
 		UserID: owner.ID, KeyID: key.ID, Model: req.Model,
 		AccountID: res.Account.ID, Tokens: tokens, Cost: tokens,

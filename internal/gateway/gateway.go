@@ -16,8 +16,6 @@
 package gateway
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -115,48 +113,28 @@ func (s *Scheduler) Pick(attempt int) (model.Account, bool) {
 // CallUpstream performs the real request against the account's BaseURL.
 // Swapping the demo /mock/upstream path for a provider endpoint is the only
 // change needed to talk to a real model.
-func CallUpstream(a model.Account, req ChatRequest) (string, error) {
-	body, _ := json.Marshal(req)
-	resp, err := http.Post(
-		a.BaseURL+"/mock/upstream?account="+a.ID,
-		"application/json",
-		bytes.NewReader(body),
-	)
+// CallUpstream dispatches to the adapter named by the account's Provider.
+// It fails closed on an unknown provider rather than falling back to the demo
+// upstream, so a misconfigured account is loud instead of silently fake.
+func CallUpstream(a model.Account, req ChatRequest) (Reply, error) {
+	p, err := ProviderFor(a.Provider)
 	if err != nil {
-		// Connection never established, so nothing was written to the client.
-		return "", RelayError{Err: err, FirstByteSent: false}
+		// A configuration fault, not an upstream fault. Retrying the same
+		// misconfigured account on the next attempt would not help, but the
+		// scheduler may still have healthy accounts on other providers, so
+		// this stays pre-first-byte and lets the walk continue.
+		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
-	defer resp.Body.Close()
-
-	var out struct {
-		Content string `json:"content"`
-	}
-	decodeErr := json.NewDecoder(resp.Body).Decode(&out)
-	if resp.StatusCode >= 300 {
-		return "", RelayError{
-			Err:           fmt.Errorf("upstream status %d", resp.StatusCode),
-			FirstByteSent: false,
-		}
-	}
-	if decodeErr != nil {
-		// The upstream sent a 200 (so the connection was established and
-		// output began) but the body was truncated — the stream was cut
-		// after the first byte. This is exactly the stream-broken case:
-		// the client may have received partial output, so the call is
-		// billed for what was produced and marked for compensation, not
-		// retried on another account.
-		return "", RelayError{
-			Err:           fmt.Errorf("stream truncated: %v", decodeErr),
-			FirstByteSent: true,
-		}
-	}
-	return out.Content, nil
+	return p.Call(a, req)
 }
 
 // Result reports which account served a request and how many attempts it took.
 type Result struct {
-	Account  model.Account
-	Text     string
+	Account model.Account
+	Text    string
+	// Tokens is the provider's own usage count, or 0 when it did not report
+	// one. Callers must not read 0 as "free".
+	Tokens   int64
 	Attempts int
 }
 
@@ -172,15 +150,20 @@ func (s *Scheduler) Relay(req ChatRequest) (Result, error) {
 			continue // no account at this index; the pool may be smaller
 		}
 
-		text, err := CallUpstream(acct, req)
+		reply, err := CallUpstream(acct, req)
 		status := "200"
 		if err != nil {
 			status = "failed"
 		}
-		log.Printf("attempt=%d account=%s -> %s", attempt, acct.ID, status)
+		log.Printf("attempt=%d account=%s provider=%s -> %s", attempt, acct.ID, acct.Provider, status)
 
 		if err == nil {
-			return Result{Account: acct, Text: text, Attempts: attempt + 1}, nil
+			return Result{
+				Account:  acct,
+				Text:     reply.Content,
+				Tokens:   reply.Tokens,
+				Attempts: attempt + 1,
+			}, nil
 		}
 		lastErr = err
 
