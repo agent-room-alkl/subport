@@ -2,7 +2,9 @@
 
 Agent 账号转 API 的网关。目标是**稳定** —— 不要总是断。
 
-> 当前状态：**第一版开发中**。网关内核、账号故障转移、用户体系都已可运行；上游仍是模拟的，用户端 `/console` 在做。详见文末「已知边界」。
+> 当前状态：**v0.1.0，可运行**。网关内核、横向故障转移、首字节不重放、SSE 流式透传、断流补偿、
+> API key 鉴权、按用户额度预留与结算、分类价目表、两个前端控制台——都已跑通并有实机验证。
+> 默认种子账号连的仍是自带的假上游（`provider=mock`），接真实供应商见「接上游供应商」。详见文末「已知边界」。
 
 ## 这个项目是怎么来的
 
@@ -69,20 +71,44 @@ go run ./cmd/subport
 
 ## 看 failover 真的发生
 
-后端自带一个 `/mock/upstream` 假上游，它对 `acct-openai-1` 固定返回 500。所以一次普通请求就能看到横向切换：
+后端自带一个 `/mock/upstream` 假上游，它对 `acct-openai-1` 固定返回 500，所以一次普通请求就能看到**同一档内的横向切换**。
+
+网关是**按 API key 鉴权**的，不带 key 会拿到 401——所以完整的三步是：
 
 ```bash
-curl -s -X POST localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[]}'
+# 1. 注册（默认邀请码 subport-invite，可用 SUBPORT_INVITE_CODE 改）
+TOKEN=$(curl -s -X POST localhost:8080/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo","password":"demo-password","invite_code":"subport-invite"}' \
+  | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+# 2. 建一把 API key（secret 只在这一次返回）
+KEY=$(curl -s -X POST localhost:8080/api/console/keys \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"demo"}' \
+  | grep -o '"secret":"[^"]*"' | cut -d'"' -f4)
+
+# 3. 调用网关
+curl -s -X POST localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-返回的内容会指名 `acct-openai-2` —— 也就是**同一档里的另一个账号**，而不是降级到二档的 `acct-anthropic-1`。服务端日志同时打出每次尝试：
+返回的内容会指名 `acct-openai-2`——**同一档里的另一个账号**，而不是降级到二档的 `acct-anthropic-1`。
+服务端日志同时打出每次尝试（下面是真实输出，不是示意）：
 
 ```
-attempt=0 account=acct-openai-1 -> 500
-attempt=1 account=acct-openai-2 -> 200
+attempt=0 account=acct-openai-1 provider=mock -> failed
+attempt=1 account=acct-openai-2 provider=mock -> 200
 ```
 
 这就是第 2 节那条铁律在跑起来的样子。
+
+流式加 `"stream":true` 即可，走 SSE 透传：帧是边到边吐的，不是攒完再发。
+断流会以一个 **SSE error 帧**告诉客户端（`{"error":{...,"type":"stream_broken"}}`），并且**不补发 `[DONE]`**——
+缺失的 `[DONE]` 本身就是「这条流没跑完」的信号。
 
 ## 用户体系
 
