@@ -115,16 +115,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnauthorized, "invalid or missing API key")
 		return
 	}
-	if owner.QuotaTotal > 0 && owner.QuotaUsed >= owner.QuotaTotal {
-		fail(w, http.StatusPaymentRequired, "quota exhausted")
-		return
-	}
-
 	var req gateway.ChatRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Model == "" {
 		req.Model = "gpt-4o-mini"
 	}
+
+	// Admission holds quota BEFORE the upstream call. The old check read
+	// quota_used here and only wrote it after the call returned - up to 120
+	// seconds later - so concurrent requests from one user all read the same
+	// number, all passed, and all billed. Reserving closes that window.
+	//
+	// Admission needs the request, so it happens after decoding rather than
+	// before it.
+	held, admitErr := admit(s.Store, owner, req)
+	if admitErr != nil {
+		if isQuotaExhausted(admitErr) {
+			fail(w, http.StatusPaymentRequired, "quota exhausted")
+			return
+		}
+		fail(w, http.StatusInternalServerError, "could not check quota")
+		return
+	}
+
+	// A hold that is never resolved is quota the user has silently lost, so
+	// the release is armed before anything can fail. Settling disarms it.
+	settled := false
+	defer func() {
+		if !settled {
+			_ = s.Store.ReleaseQuota(owner.ID, held)
+		}
+	}()
 
 	var res gateway.Result
 	var relayErr error
@@ -152,11 +173,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			// something concrete to credit back.
 			cost = 50
 		}
-		_ = s.Store.AddUsage(model.UsageLog{
+		// Settling releases the hold in the same transaction that records the
+		// call, so a failed request cannot leave quota pinned.
+		_ = s.Store.SettleUsage(model.UsageLog{
 			UserID: owner.ID, KeyID: key.ID, Model: req.Model,
 			AccountID: res.Account.ID, Status: status, StreamBroken: broken,
 			Cost: cost, Attempts: res.Attempts,
-		})
+		}, held)
+		settled = true
 
 		// Auto-compensation: check whether this user's broken-call rate
 		// has crossed the threshold. If it has, the cost of the broken
@@ -184,11 +208,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if tokens <= 0 {
 		tokens = int64(len(res.Text))
 	}
-	_ = s.Store.AddUsage(model.UsageLog{
+	// The real cost is charged and the whole hold is released together. The
+	// estimate never becomes the bill: over-reserving refunds, under-reserving
+	// still charges what the call actually cost.
+	_ = s.Store.SettleUsage(model.UsageLog{
 		UserID: owner.ID, KeyID: key.ID, Model: req.Model,
 		AccountID: res.Account.ID, Tokens: tokens, Cost: tokens,
 		Status: "success", Attempts: res.Attempts,
-	})
+	}, held)
+	settled = true
 
 	if req.Stream {
 		// Body already flushed through by RelayStream.
