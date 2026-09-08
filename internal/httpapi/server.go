@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/agent-room-alkl/subport/internal/gateway"
 	"github.com/agent-room-alkl/subport/internal/model"
@@ -93,23 +94,63 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	// The gateway is authenticated by API key, not by session. Without this,
+	// anyone reachable could spend upstream capacity, usage could not be
+	// attributed to anyone, and the quota on every user would be unenforceable.
+	key, owner, keyErr := s.Store.KeyBySecret(bearer(r))
+	if keyErr != nil {
+		// One message whether the key is absent, unknown, or disabled - a
+		// caller should not be able to probe which keys exist.
+		fail(w, http.StatusUnauthorized, "invalid or missing API key")
+		return
+	}
+	if owner.QuotaTotal > 0 && owner.QuotaUsed >= owner.QuotaTotal {
+		fail(w, http.StatusPaymentRequired, "quota exhausted")
+		return
+	}
+
 	var req gateway.ChatRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Model == "" {
 		req.Model = "gpt-4o-mini"
 	}
 
-	res, err := s.Sched.Relay(req)
-	if err != nil {
-		var relayErr gateway.RelayError
-		if ok := asRelay(err, &relayErr); ok && relayErr.FirstByteSent {
+	res, relayErr := s.Sched.Relay(req)
+	s.Store.TouchKey(key.ID, time.Now().UTC().Format("2006-01-02 15:04"))
+
+	if relayErr != nil {
+		var re gateway.RelayError
+		broken := asRelay(relayErr, &re) && re.FirstByteSent
+
+		// Recorded either way so the user can see what happened, but a failure
+		// is not billed. A stream cut after output began IS billed for what was
+		// produced, and is marked so it can be appealed - see docs/MERGE_REPORT.md.
+		status := "failed"
+		if broken {
+			status = "stream_broken"
+		}
+		_ = s.Store.AddUsage(model.UsageLog{
+			UserID: owner.ID, KeyID: key.ID, Model: req.Model,
+			AccountID: res.Account.ID, Status: status, StreamBroken: broken,
+			Attempts: res.Attempts,
+		})
+
+		if broken {
 			// Output already began; report the cut rather than replaying it.
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			http.Error(w, relayErr.Error(), http.StatusBadGateway)
 			return
 		}
 		http.Error(w, "no healthy account", http.StatusServiceUnavailable)
 		return
 	}
+
+	// Billed against the owner resolved from the key, never from the request.
+	tokens := int64(len(res.Text))
+	_ = s.Store.AddUsage(model.UsageLog{
+		UserID: owner.ID, KeyID: key.ID, Model: req.Model,
+		AccountID: res.Account.ID, Tokens: tokens, Cost: tokens,
+		Status: "success", Attempts: res.Attempts,
+	})
 
 	if req.Stream {
 		gateway.WriteSSE(w, res.Text)
@@ -122,6 +163,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"message":       map[string]string{"role": "assistant", "content": res.Text},
 			"finish_reason": "stop",
 		}},
+		"usage": map[string]any{"total_tokens": tokens},
 	})
 }
 

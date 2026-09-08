@@ -255,6 +255,52 @@ func (s *Store) CreateKey(userID, name string) (model.APIKey, string, error) {
 	return k, secret, s.flush()
 }
 
+// KeyBySecret resolves a presented API key to its record and owner.
+// This is the gateway's authentication path: without it, /v1/* would serve
+// anyone, usage could not be attributed, and quota could not be enforced.
+// Disabled keys are refused here rather than by the caller, so a revoked key
+// stops working everywhere at once.
+func (s *Store) KeyBySecret(secret string) (model.APIKey, model.User, error) {
+	if secret == "" {
+		return model.APIKey{}, model.User{}, ErrNotFound
+	}
+	sum := HashWithSalt(secret, "")
+
+	s.mu.RLock()
+	var found model.APIKey
+	ok := false
+	for _, k := range s.d.Keys {
+		if k.SecretSHA == sum {
+			found = k
+			ok = true
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if !ok || !found.Enabled {
+		return model.APIKey{}, model.User{}, ErrNotFound
+	}
+	u, err := s.UserByID(found.UserID)
+	if err != nil {
+		return model.APIKey{}, model.User{}, ErrNotFound
+	}
+	return found, u, nil
+}
+
+// TouchKey records that a key was just used, for the "last used" column.
+func (s *Store) TouchKey(keyID, when string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.d.Keys {
+		if s.d.Keys[i].ID == keyID {
+			s.d.Keys[i].LastUsed = when
+			_ = s.flush()
+			return
+		}
+	}
+}
+
 // KeyByID is scoped: a key belonging to another user reads as not-found, so
 // guessing an id leaks nothing about whether it exists.
 func (s *Store) KeyByID(userID, keyID string) (model.APIKey, error) {
