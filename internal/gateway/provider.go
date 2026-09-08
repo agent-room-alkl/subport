@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -62,6 +63,25 @@ func credentialFor(provider string) string {
 		return v
 	}
 	return os.Getenv("SUBPORT_PROVIDER_KEY")
+}
+
+// bearerPattern matches an Authorization-shaped token anywhere in a string.
+// Upstreams and proxies sometimes echo the request headers back inside an
+// error body; we must never pass that through to a caller.
+var bearerPattern = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-]+`)
+
+// redactSecrets scrubs an upstream-supplied string before it is shown to
+// anyone. It removes the exact credential we presented, then any remaining
+// Authorization-shaped token, so a hostile or careless upstream cannot use
+// its error message as a channel for handing our key back to the caller.
+//
+// The provider's own wording is preserved otherwise - distinguishing a quota
+// problem from a rate limit is the reason for carrying it at all.
+func redactSecrets(msg, credential string) string {
+	if credential != "" {
+		msg = strings.ReplaceAll(msg, credential, "[REDACTED]")
+	}
+	return bearerPattern.ReplaceAllString(msg, "Bearer [REDACTED]")
 }
 
 // ---------------------------------------------------------------- mock
@@ -162,7 +182,8 @@ func (openAIProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if key := credentialFor(a.Provider); key != "" {
+	key := credentialFor(a.Provider)
+	if key != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+key)
 	}
 
@@ -181,14 +202,20 @@ func (openAIProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 		if out.Error != nil && out.Error.Message != "" {
 			// Carry the provider's own words - "insufficient_quota" and
 			// "rate_limit" need different operator responses, and a bare
-			// status code hides which one happened.
-			msg = fmt.Sprintf("%s: %s", msg, out.Error.Message)
+			// status code hides which one happened. But scrub first: this
+			// text can reach an API client, and an upstream or proxy that
+			// echoes the Authorization header back would otherwise hand our
+			// own credential to the caller.
+			msg = fmt.Sprintf("%s: %s", msg, redactSecrets(out.Error.Message, key))
 		}
 		return Reply{}, RelayError{Err: fmt.Errorf("%s", msg), FirstByteSent: false}
 	}
 	if decodeErr != nil {
+		// This one DOES reach the caller as a 502 body, since a broken stream
+		// is reported rather than replayed. A decode error can quote the bytes
+		// it choked on, so it goes through the same scrub.
 		return Reply{}, RelayError{
-			Err:           fmt.Errorf("stream truncated: %v", decodeErr),
+			Err:           fmt.Errorf("stream truncated: %v", redactSecrets(decodeErr.Error(), key)),
 			FirstByteSent: true,
 		}
 	}

@@ -160,3 +160,106 @@ func asRelayErr(err error, target *RelayError) bool {
 	}
 	return ok
 }
+
+// The reject that produced this test: an upstream (or a proxy in front of it)
+// that echoes the request's Authorization header inside its error body. We
+// carry the provider's wording through to the caller, so without scrubbing we
+// would hand our own credential to whoever made the API call.
+func TestUpstreamEchoingAuthorizationDoesNotLeakCredential(t *testing.T) {
+	const secret = "sk-super-secret-should-never-leak"
+
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad auth: ` + r.Header.Get("Authorization") + `","type":"invalid_request_error"}}`))
+	}))
+	defer stub.Close()
+
+	t.Setenv("SUBPORT_PROVIDER_KEY_OPENAI", secret)
+
+	_, err := CallUpstream(model.Account{Provider: "openai", BaseURL: stub.URL}, ChatRequest{})
+	if err == nil {
+		t.Fatal("expected an error for a 401")
+	}
+	got := err.Error()
+	if strings.Contains(got, secret) {
+		t.Fatalf("credential leaked to the caller: %q", got)
+	}
+	if strings.Contains(got, "Bearer "+secret) {
+		t.Fatalf("credential leaked in header form: %q", got)
+	}
+	// The reason for carrying provider text at all must survive redaction.
+	if !strings.Contains(got, "upstream status 401") || !strings.Contains(got, "bad auth") {
+		t.Errorf("redaction destroyed the diagnostic: %q", got)
+	}
+}
+
+// Redaction must not depend on recognising our own key: a proxy can echo some
+// other Authorization value, and an operator reading logs should never have to
+// wonder whether a Bearer token in an error string was real.
+func TestRedactSecretsStripsAnyBearerShape(t *testing.T) {
+	cases := []struct {
+		name, msg, key, wantAbsent string
+	}{
+		{"our key, bare", "quota exhausted for sk-mine-1234", "sk-mine-1234", "sk-mine-1234"},
+		{"our key, header form", "rejected Bearer sk-mine-1234 upstream", "sk-mine-1234", "sk-mine-1234"},
+		{"someone else's bearer", "proxy said Bearer sk-other-9999 is bad", "sk-mine-1234", "sk-other-9999"},
+		{"lowercase bearer", "auth failed: bearer sk-other-9999", "", "sk-other-9999"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactSecrets(tc.msg, tc.key)
+			if strings.Contains(got, tc.wantAbsent) {
+				t.Errorf("redactSecrets(%q) = %q, still contains %q", tc.msg, got, tc.wantAbsent)
+			}
+			if !strings.Contains(got, "[REDACTED]") {
+				t.Errorf("redactSecrets(%q) = %q, want a redaction marker", tc.msg, got)
+			}
+		})
+	}
+}
+
+// Redaction is a scrub, not a gag: an error with no secret in it must come
+// through untouched, or operators lose the ability to tell an out-of-quota
+// account from a rate-limited one.
+func TestRedactSecretsLeavesCleanMessagesAlone(t *testing.T) {
+	msg := "You exceeded your current quota (insufficient_quota)"
+	if got := redactSecrets(msg, "sk-mine-1234"); got != msg {
+		t.Errorf("redactSecrets mangled a clean message: %q", got)
+	}
+}
+
+// The scrub has to hold at the seam, not just inside the adapter: Relay's
+// returned error is what httpapi hands to an API client on a broken stream.
+// Two hostile peers in one tier also re-prove horizontal-first failover with
+// the real openai adapter rather than the mock.
+func TestRelayDoesNotLeakCredentialAcrossFailover(t *testing.T) {
+	const secret = "sk-relay-secret-must-not-escape"
+
+	var hits int
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"proxy rejected ` + r.Header.Get("Authorization") + `"}}`))
+	}))
+	defer stub.Close()
+
+	t.Setenv("SUBPORT_PROVIDER_KEY_OPENAI", secret)
+
+	s := NewScheduler([]model.Account{
+		{ID: "a1", Provider: "openai", BaseURL: stub.URL, Priority: 1, Healthy: true},
+		{ID: "a2", Provider: "openai", BaseURL: stub.URL, Priority: 1, Healthy: true},
+	})
+
+	_, err := s.Relay(ChatRequest{})
+	if err == nil {
+		t.Fatal("expected the walk to exhaust both hostile accounts")
+	}
+	if hits < 2 {
+		t.Errorf("upstream hit %d times, want both tier-1 peers tried before giving up", hits)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("credential reached Relay's caller: %q", err.Error())
+	}
+}

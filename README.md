@@ -175,6 +175,8 @@ admin 访问 /api/accounts -> 200
 | `SUBPORT_PROVIDER_KEY` | 所有供应商共用的默认密钥 |
 | `SUBPORT_PROVIDER_KEY_<PROVIDER>` | 按供应商覆盖，例如 `SUBPORT_PROVIDER_KEY_OPENAI`。优先于上面那个 |
 
+上游的报错文本会带回给调用方（区分 `insufficient_quota` 和 `rate_limit` 需要它），但**先经过一次脱敏**：我们自己递出去的那把 key、以及任何 `Bearer <token>` 形状的片段，都会被替换成 `[REDACTED]`。原因是一个会把请求头回显进错误体的上游或代理——真实存在——否则就等于我们把自己的凭据交给了 API 调用方。
+
 接一个真实账号，`provider` 和 `base_url` **必须同时设对**：种子账号叫 "OpenAI primary (demo)" 但 `provider=mock`，因为它们指向的是本进程的假上游。把 provider 改成 `openai` 却不改 base_url，请求就会去假上游要 `/v1/chat/completions`，然后整条链路以 "no healthy account" 失败——这个坑我们已经踩过一次了。
 
 Anthropic 的 `/v1/messages` + `x-api-key` 形状不同，还没写适配器；加它只需要新增一个 provider 实现，不用动调度器。
