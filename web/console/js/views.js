@@ -119,12 +119,26 @@ const STATUS_PILL = {
 function usageView(rows) {
   if (!rows.length) return `<div class="card"><div class="empty">还没有调用记录</div></div>`;
 
-  const broken = rows.filter((r) => r.stream_broken).length;
-  const note = broken
-    ? `<div class="banner"><span>ⓘ</span><div>这段记录里有 <b>${broken}</b> 次<b>中途断流</b>。
-       断流按已生成的 token 计费——你没拿到完整回答，但已产出的部分仍然产生了成本。
-       如果你认为某次断流不该计费，可以拿这条记录来申诉。</div></div>`
-    : '';
+  const broken = rows.filter((r) => r.stream_broken);
+  const paidBack = broken.filter((r) => r.compensated);
+  const outstanding = broken.length - paidBack.length;
+
+  // Say what happened AND what was done about it. A user who sees "cut off but
+  // charged" should find the outcome here, not have to ask.
+  let note = '';
+  if (broken.length) {
+    const refunded = paidBack.reduce((sum, r) => sum + (r.cost || 0), 0);
+    note = `<div class="banner"><span>ⓘ</span><div>
+      这段记录里有 <b>${broken.length}</b> 次<b>中途断流</b>。断流按已生成的 token 计费——
+      你没拿到完整回答，但已产出的部分仍然产生了成本。`
+      + (paidBack.length
+          ? ` 其中 <b>${paidBack.length}</b> 次已<b>自动补偿</b>，退回 <b>${num(refunded)}</b>。`
+          : '')
+      + (outstanding
+          ? ` 还有 <b>${outstanding}</b> 次未补偿；如果你认为不该计费，可以拿这条记录申诉。`
+          : '')
+      + `</div></div>`;
+  }
 
   return note + `
   <div class="card">
@@ -137,14 +151,20 @@ function usageView(rows) {
       </tr></thead>
       <tbody>${rows.map((r) => {
         const [cls, label] = STATUS_PILL[r.status] || ['off', r.status];
+        // A compensated charge is struck through, so the refund is visible in
+        // the number itself rather than only in a badge.
+        const cost = r.compensated
+          ? `<s style="color:var(--text-faint)">${num(r.cost)}</s>`
+          : num(r.cost);
         return `
         <tr>
           <td class="mono" style="color:var(--text-dim)">${when(r.created_at)}</td>
           <td><code>${esc(r.model)}</code></td>
           <td class="num">${num(r.tokens)}</td>
-          <td class="num">${num(r.cost)}</td>
+          <td class="num">${cost}</td>
           <td class="num" style="color:${r.attempts > 1 ? 'var(--warn)' : 'var(--text-dim)'}">${r.attempts}</td>
-          <td><span class="pill ${cls}">${esc(label)}</span></td>
+          <td><span class="pill ${cls}">${esc(label)}</span>${
+            r.compensated ? ' <span class="pill ok">已补偿</span>' : ''}</td>
         </tr>`;
       }).join('')}</tbody>
     </table></div>

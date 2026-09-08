@@ -164,7 +164,8 @@ const demo = {
   usage: [
     { id: 'u1', created_at: '2026-09-08T11:42:00Z', model: 'gpt-4o',           tokens: 1820, cost: 182, status: 'success',       attempts: 1, stream_broken: false },
     { id: 'u2', created_at: '2026-09-08T11:31:00Z', model: 'claude-sonnet-4',  tokens: 3410, cost: 341, status: 'success',       attempts: 2, stream_broken: false },
-    { id: 'u3', created_at: '2026-09-08T11:08:00Z', model: 'gpt-4o',           tokens:  640, cost:  64, status: 'stream_broken', attempts: 1, stream_broken: true  },
+    { id: 'u3', created_at: '2026-09-08T11:08:00Z', model: 'gpt-4o',           tokens:  640, cost:  64, status: 'stream_broken', attempts: 1, stream_broken: true,  compensated: false },
+    { id: 'u6', created_at: '2026-09-08T09:14:00Z', model: 'gpt-4o',           tokens:  980, cost:  98, status: 'stream_broken', attempts: 1, stream_broken: true,  compensated: true  },
     { id: 'u4', created_at: '2026-09-08T10:55:00Z', model: 'gpt-4o-mini',      tokens:  210, cost:  21, status: 'success',       attempts: 1, stream_broken: false },
     { id: 'u5', created_at: '2026-09-08T10:31:00Z', model: 'claude-opus-4',    tokens:    0, cost:   0, status: 'failed',        attempts: 3, stream_broken: false },
   ],
