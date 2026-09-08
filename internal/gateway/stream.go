@@ -96,7 +96,10 @@ func (openAIProvider) Stream(a model.Account, req ChatRequest, w http.ResponseWr
         for _, m := range req.Messages {
                 msgs = append(msgs, openAIChatMessage{Role: m.Role, Content: m.Content})
         }
-        body, err := json.Marshal(openAIRequest{Model: req.Model, Messages: msgs, Stream: true})
+        body, err := json.Marshal(openAIRequest{
+                Model: req.Model, Messages: msgs, Stream: true,
+                StreamOptions: &openAIStreamOptions{IncludeUsage: true},
+        })
         if err != nil {
                 return 0, RelayError{Err: err, FirstByteSent: false}
         }
@@ -128,7 +131,9 @@ func (openAIProvider) Stream(a model.Account, req ChatRequest, w http.ResponseWr
         ensureSSEHeaders(w)
         flusher, _ := w.(http.Flusher)
         firstByte := false
+        sawDone := false
         var tokens int64
+        var contentLen int64
         reader := bufio.NewReader(resp.Body)
         for {
                 line, readErr := reader.ReadString('\n')
@@ -141,19 +146,31 @@ func (openAIProvider) Stream(a model.Account, req ChatRequest, w http.ResponseWr
                                 }
                         }
                         if werr != nil {
-                                return tokens, RelayError{Err: werr, FirstByteSent: firstByte}
+                                return billableTokens(tokens, contentLen), RelayError{Err: werr, FirstByteSent: firstByte}
                         }
                         trimmed := strings.TrimRight(line, "\r\n")
                         if strings.HasPrefix(trimmed, "data:") {
                                 data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-                                if data != "" && data != "[DONE]" {
+                                if data == "[DONE]" {
+                                        sawDone = true
+                                } else if data != "" {
                                         var frame struct {
+                                                Choices []struct {
+                                                        Delta struct {
+                                                                Content string `json:"content"`
+                                                        } `json:"delta"`
+                                                } `json:"choices"`
                                                 Usage *struct {
                                                         TotalTokens int64 `json:"total_tokens"`
                                                 } `json:"usage"`
                                         }
-                                        if json.Unmarshal([]byte(data), &frame) == nil && frame.Usage != nil && frame.Usage.TotalTokens > 0 {
-                                                tokens = frame.Usage.TotalTokens
+                                        if json.Unmarshal([]byte(data), &frame) == nil {
+                                                if frame.Usage != nil && frame.Usage.TotalTokens > 0 {
+                                                        tokens = frame.Usage.TotalTokens
+                                                }
+                                                for _, c := range frame.Choices {
+                                                        contentLen += int64(len(c.Delta.Content))
+                                                }
                                         }
                                 }
                         }
@@ -163,9 +180,31 @@ func (openAIProvider) Stream(a model.Account, req ChatRequest, w http.ResponseWr
                                 if !firstByte {
                                         return 0, RelayError{Err: fmt.Errorf("upstream closed before any byte"), FirstByteSent: false}
                                 }
-                                return tokens, nil
+                                if !sawDone {
+                                        // Clean HTTP end without [DONE] is an incomplete stream, not success.
+                                        return billableTokens(tokens, contentLen), RelayError{
+                                                Err:           fmt.Errorf("stream ended without [DONE]"),
+                                                FirstByteSent: true,
+                                        }
+                                }
+                                return billableTokens(tokens, contentLen), nil
                         }
-                        return tokens, RelayError{Err: fmt.Errorf("stream truncated: %v", redactSecrets(readErr.Error(), key)), FirstByteSent: firstByte}
+                        return billableTokens(tokens, contentLen), RelayError{
+                                Err:           fmt.Errorf("stream truncated: %v", redactSecrets(readErr.Error(), key)),
+                                FirstByteSent: firstByte,
+                        }
                 }
         }
+}
+
+// billableTokens prefers provider usage; if absent, falls back to accumulated
+// delta content length so 0 never means "free" on a streamed completion.
+func billableTokens(usage, contentLen int64) int64 {
+        if usage > 0 {
+                return usage
+        }
+        if contentLen > 0 {
+                return contentLen
+        }
+        return 0
 }

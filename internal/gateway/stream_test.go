@@ -2,6 +2,7 @@
 
 import (
         "io"
+	"encoding/json"
         "net/http"
         "net/http/httptest"
         "strings"
@@ -142,4 +143,60 @@ func (f *flushWriter) Header() http.Header {
 func (f *flushWriter) Write(p []byte) (int, error) { return f.w.Write(p) }
 func (f *flushWriter) WriteHeader(int)             {}
 func (f *flushWriter) Flush()                      {}
+
+
+func TestOpenAIStreamEOFWithoutDoneIsBroken(t *testing.T) {
+        stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                w.Header().Set("Content-Type", "text/event-stream")
+                fl := w.(http.Flusher)
+                _, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"half a sen\"}}]}\n\n")
+                fl.Flush()
+                // clean HTTP end, no [DONE]
+        }))
+        defer stub.Close()
+        rec := httptest.NewRecorder()
+        s := NewScheduler([]model.Account{{ID: "a1", Provider: "openai", BaseURL: stub.URL, Priority: 1, Healthy: true}})
+        res, err := s.RelayStream(ChatRequest{Stream: true, Model: "gpt-4o"}, rec)
+        if err == nil {
+                t.Fatal("expected incomplete stream error")
+        }
+        re, ok := err.(RelayError)
+        if !ok || !re.FirstByteSent {
+                t.Fatalf("want FirstByteSent RelayError, got %T %v", err, err)
+        }
+        if !strings.Contains(rec.Body.String(), "half a sen") {
+                t.Fatalf("client missing partial content: %q", rec.Body.String())
+        }
+        if res.Tokens <= 0 {
+                t.Fatalf("tokens fallback should be >0 from delta content, got %d", res.Tokens)
+        }
+}
+
+func TestOpenAIStreamRequestsIncludeUsage(t *testing.T) {
+        var gotBody openAIRequest
+        stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                _ = json.NewDecoder(r.Body).Decode(&gotBody)
+                w.Header().Set("Content-Type", "text/event-stream")
+                fl := w.(http.Flusher)
+                _, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+                fl.Flush()
+                _, _ = io.WriteString(w, "data: {\"usage\":{\"total_tokens\":12}}\n\n")
+                fl.Flush()
+                _, _ = io.WriteString(w, "data: [DONE]\n\n")
+                fl.Flush()
+        }))
+        defer stub.Close()
+        rec := httptest.NewRecorder()
+        s := NewScheduler([]model.Account{{ID: "a1", Provider: "openai", BaseURL: stub.URL, Priority: 1, Healthy: true}})
+        res, err := s.RelayStream(ChatRequest{Stream: true, Model: "gpt-4o"}, rec)
+        if err != nil {
+                t.Fatal(err)
+        }
+        if gotBody.StreamOptions == nil || !gotBody.StreamOptions.IncludeUsage {
+                t.Fatalf("missing stream_options.include_usage: %+v", gotBody.StreamOptions)
+        }
+        if res.Tokens != 12 {
+                t.Fatalf("tokens=%d want 12 from usage frame", res.Tokens)
+        }
+}
 

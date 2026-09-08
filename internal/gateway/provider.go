@@ -140,9 +140,14 @@ type openAIProvider struct{}
 func (openAIProvider) Name() string { return "openai" }
 
 type openAIRequest struct {
-	Model    string              `json:"model"`
-	Messages []openAIChatMessage `json:"messages"`
-	Stream   bool                `json:"stream"`
+	Model         string              `json:"model"`
+	Messages      []openAIChatMessage `json:"messages"`
+	Stream        bool                `json:"stream"`
+	StreamOptions *openAIStreamOptions `json:"stream_options,omitempty"`
+}
+
+type openAIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type openAIChatMessage struct {
