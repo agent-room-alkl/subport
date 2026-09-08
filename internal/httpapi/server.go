@@ -192,6 +192,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if broken {
+			if req.Stream {
+				// The cut was already reported inside the stream, as an SSE
+				// error frame, where the client is actually listening. Calling
+				// http.Error here would pretend a status can still be set -
+				// the headers went out with the first frame - and would splice
+				// an unparseable bare line into the stream.
+				return
+			}
 			// Output already began; report the cut rather than replaying it.
 			http.Error(w, relayErr.Error(), http.StatusBadGateway)
 			return

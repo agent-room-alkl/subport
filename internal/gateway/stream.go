@@ -39,6 +39,13 @@ func (s *Scheduler) RelayStream(req ChatRequest, w http.ResponseWriter) (Result,
 		}
 		lastErr = err
 		if re, ok := err.(RelayError); ok && re.FirstByteSent {
+			// Output already began, so no status code can still be set - the
+			// headers left with the first frame. The only thing the client can
+			// still be told is another frame, so say it in the one shape an
+			// SSE client can parse. Without this the caller gets a truncated
+			// answer and no signal that it was truncated, which is
+			// indistinguishable from the model simply stopping.
+			writeStreamError(w, re.Error())
 			return Result{Account: acct, Attempts: attempt + 1, Tokens: tokens}, err
 		}
 	}
@@ -46,6 +53,30 @@ func (s *Scheduler) RelayStream(req ChatRequest, w http.ResponseWriter) (Result,
 		lastErr = fmt.Errorf("no healthy account")
 	}
 	return Result{}, lastErr
+}
+
+// writeStreamError emits the one thing a client can still act on once bytes
+// are out: a well-formed SSE frame carrying an error object.
+//
+// It deliberately does NOT emit [DONE] afterwards. [DONE] is the signal that a
+// stream completed, so sending it here would tell the client the opposite of
+// what happened. A cut stream is "frames, then an error frame, then nothing",
+// and that missing [DONE] is what distinguishes it from a clean end.
+func writeStreamError(w http.ResponseWriter, msg string) {
+	ensureSSEHeaders(w)
+	payload, err := json.Marshal(map[string]any{
+		"error": map[string]string{
+			"message": msg,
+			"type":    "stream_broken",
+		},
+	})
+	if err != nil {
+		return
+	}
+	_, _ = io.WriteString(w, "data: "+string(payload)+"\n\n")
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
 }
 
 func ensureSSEHeaders(w http.ResponseWriter) {
