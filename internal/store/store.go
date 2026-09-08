@@ -160,6 +160,15 @@ func (s *Store) CreateUser(username, password, role string) (model.User, error) 
 		QuotaTotal:   1_000_000,
 		CreatedAt:    time.Now().UTC(),
 	}
+	if s.db != nil {
+		if _, err := s.sqliteUserByName(username); err == nil {
+			return model.User{}, errors.New("username already taken")
+		}
+		if err := s.sqliteCreateUser(u); err != nil {
+			return model.User{}, err
+		}
+		return u, nil
+	}
 	s.d.Users = append(s.d.Users, u)
 	return u, s.flush()
 }
@@ -168,6 +177,13 @@ func (s *Store) Authenticate(username, password string) (model.User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	username = NormUsername(username)
+	if s.db != nil {
+		u, err := s.sqliteUserByName(username)
+		if err != nil || u.PasswordHash != HashWithSalt(password, u.Salt) {
+			return model.User{}, ErrNotFound
+		}
+		return u, nil
+	}
 	for _, u := range s.d.Users {
 		if NormUsername(u.Username) == username && u.PasswordHash == HashWithSalt(password, u.Salt) {
 			return u, nil
@@ -179,6 +195,9 @@ func (s *Store) Authenticate(username, password string) (model.User, error) {
 func (s *Store) UserByID(id string) (model.User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.db != nil {
+		return s.sqliteUserByID(id)
+	}
 	for _, u := range s.d.Users {
 		if u.ID == id {
 			return u, nil
@@ -199,12 +218,23 @@ func (s *Store) NewSession(userID string) (model.Session, error) {
 		UserID:    userID,
 		ExpiresAt: time.Now().UTC().Add(7 * 24 * time.Hour),
 	}
+	if s.db != nil {
+		return sess, s.sqliteNewSession(sess)
+	}
 	s.d.Sessions = append(s.d.Sessions, sess)
 	return sess, s.flush()
 }
 
 func (s *Store) SessionUser(token string) (model.User, error) {
 	s.mu.RLock()
+	if s.db != nil {
+		userID, expires, err := s.sqliteSessionUser(token)
+		s.mu.RUnlock()
+		if err != nil || time.Now().UTC().After(expires) {
+			return model.User{}, ErrNotFound
+		}
+		return s.UserByID(userID)
+	}
 	var userID string
 	for _, sess := range s.d.Sessions {
 		if sess.Token == token {
@@ -226,6 +256,10 @@ func (s *Store) SessionUser(token string) (model.User, error) {
 func (s *Store) DropSession(token string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		_, err := s.db.Exec(`DELETE FROM sessions WHERE token=?`, token)
+		return err
+	}
 	out := s.d.Sessions[:0]
 	for _, sess := range s.d.Sessions {
 		if sess.Token != token {
