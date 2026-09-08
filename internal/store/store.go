@@ -79,6 +79,14 @@ func OpenStore(path, seedBaseURL string) (*Store, error) {
 			_ = db.Close()
 			return nil, err
 		}
+		if err := s.sqliteEnsureKeys(s.d.Keys); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if err := s.sqliteEnsureUsage(s.d.Usage); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 		return s, nil
 	}
 	if !os.IsNotExist(err) {
@@ -87,6 +95,14 @@ func OpenStore(path, seedBaseURL string) (*Store, error) {
 	}
 	s.d = data{Accounts: seedAccounts(seedBaseURL)}
 	if err := s.sqliteEnsureAccounts(s.d.Accounts); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.sqliteEnsureKeys(s.d.Keys); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.sqliteEnsureUsage(s.d.Usage); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -114,6 +130,15 @@ func (s *Store) save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.flush()
+}
+
+func (s *Store) Close() error {
+	if s.db == nil {
+		return nil
+	}
+	err := s.db.Close()
+	s.db = nil
+	return err
 }
 
 // ---------------------------------------------------------------- ids, hashing
@@ -287,6 +312,13 @@ func (s *Store) DropSession(token string) error {
 func (s *Store) KeysOf(userID string) []model.APIKey {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.db != nil {
+		out, err := s.sqliteKeysOf(userID)
+		if err != nil {
+			return []model.APIKey{}
+		}
+		return out
+	}
 	out := []model.APIKey{}
 	for _, k := range s.d.Keys {
 		if k.UserID == userID {
@@ -311,6 +343,12 @@ func (s *Store) CreateKey(userID, name string) (model.APIKey, string, error) {
 		CreatedAt: time.Now().UTC(),
 		LastUsed:  "never",
 	}
+	if s.db != nil {
+		if err := s.sqliteInsertKey(k); err != nil {
+			return model.APIKey{}, "", err
+		}
+		return k, secret, nil
+	}
 	s.d.Keys = append(s.d.Keys, k)
 	return k, secret, s.flush()
 }
@@ -329,11 +367,19 @@ func (s *Store) KeyBySecret(secret string) (model.APIKey, model.User, error) {
 	s.mu.RLock()
 	var found model.APIKey
 	ok := false
-	for _, k := range s.d.Keys {
-		if k.SecretSHA == sum {
+	if s.db != nil {
+		k, err := s.sqliteKeyBySecretHash(sum)
+		if err == nil {
 			found = k
 			ok = true
-			break
+		}
+	} else {
+		for _, k := range s.d.Keys {
+			if k.SecretSHA == sum {
+				found = k
+				ok = true
+				break
+			}
 		}
 	}
 	s.mu.RUnlock()
@@ -352,6 +398,10 @@ func (s *Store) KeyBySecret(secret string) (model.APIKey, model.User, error) {
 func (s *Store) TouchKey(keyID, when string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		_ = s.sqliteTouchKey(keyID, when)
+		return
+	}
 	for i := range s.d.Keys {
 		if s.d.Keys[i].ID == keyID {
 			s.d.Keys[i].LastUsed = when
@@ -366,6 +416,9 @@ func (s *Store) TouchKey(keyID, when string) {
 func (s *Store) KeyByID(userID, keyID string) (model.APIKey, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.db != nil {
+		return s.sqliteKeyByID(userID, keyID)
+	}
 	for _, k := range s.d.Keys {
 		if k.ID == keyID && k.UserID == userID {
 			return k, nil
@@ -377,6 +430,9 @@ func (s *Store) KeyByID(userID, keyID string) (model.APIKey, error) {
 func (s *Store) SetKeyEnabled(userID, keyID string, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		return s.sqliteSetKeyEnabled(userID, keyID, enabled)
+	}
 	for i := range s.d.Keys {
 		if s.d.Keys[i].ID == keyID && s.d.Keys[i].UserID == userID {
 			s.d.Keys[i].Enabled = enabled
@@ -389,6 +445,9 @@ func (s *Store) SetKeyEnabled(userID, keyID string, enabled bool) error {
 func (s *Store) DeleteKey(userID, keyID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		return s.sqliteDeleteKey(userID, keyID)
+	}
 	found := false
 	out := s.d.Keys[:0]
 	for _, k := range s.d.Keys {
@@ -410,6 +469,13 @@ func (s *Store) DeleteKey(userID, keyID string) error {
 func (s *Store) UsageOf(userID string, limit int) []model.UsageLog {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.db != nil {
+		out, err := s.sqliteUsageOf(userID, limit)
+		if err != nil {
+			return []model.UsageLog{}
+		}
+		return out
+	}
 	out := []model.UsageLog{}
 	for i := len(s.d.Usage) - 1; i >= 0 && len(out) < limit; i-- {
 		if s.d.Usage[i].UserID == userID {
@@ -424,6 +490,9 @@ func (s *Store) AddUsage(l model.UsageLog) error {
 	defer s.mu.Unlock()
 	l.ID = NewID("use")
 	l.CreatedAt = time.Now().UTC()
+	if s.db != nil {
+		return s.sqliteAddUsage(l)
+	}
 	s.d.Usage = append(s.d.Usage, l)
 	for i := range s.d.Users {
 		if s.d.Users[i].ID == l.UserID {
@@ -474,6 +543,43 @@ func (s *Store) SetAccountHealthy(id string, healthy bool) error {
 func (s *Store) CompensateBrokenStreams(userID string, cfg model.CompensationConfig) (model.CompensationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.db != nil {
+		recent, err := s.sqliteUsageOf(userID, cfg.WindowSize)
+		if err != nil {
+			return model.CompensationResult{}, err
+		}
+		result := model.CompensationResult{TotalCount: len(recent)}
+		for _, l := range recent {
+			if l.StreamBroken {
+				result.BrokenCount++
+			}
+		}
+		if result.TotalCount > 0 {
+			result.Rate = float64(result.BrokenCount) / float64(result.TotalCount)
+		}
+		if result.BrokenCount < cfg.MinBroken || result.Rate < cfg.Threshold {
+			return result, nil
+		}
+		var credit int64
+		var ids []string
+		for _, l := range recent {
+			if l.StreamBroken && !l.Compensated {
+				credit += l.Cost
+				ids = append(ids, l.ID)
+			}
+		}
+		if err := s.sqliteMarkUsageCompensated(ids); err != nil {
+			return model.CompensationResult{}, err
+		}
+		if err := s.sqliteCreditQuota(userID, credit); err != nil {
+			return model.CompensationResult{}, err
+		}
+		result.Triggered = true
+		result.Credited = credit
+		result.CompensatedCount = len(ids)
+		return result, nil
+	}
 
 	// Collect the user's recent calls, most-recent-first.
 	var recent []model.UsageLog
@@ -543,6 +649,13 @@ func (s *Store) CompensateBrokenStreams(userID string, cfg model.CompensationCon
 func (s *Store) Compensations() (pending, completed []model.UsageLog) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.db != nil {
+		p, c, err := s.sqliteCompensations()
+		if err != nil {
+			return nil, nil
+		}
+		return p, c
+	}
 	for _, l := range s.d.Usage {
 		if !l.StreamBroken {
 			continue
