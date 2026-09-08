@@ -35,19 +35,46 @@ new-api 原生的重试是「逐档下降」—— 第 N 次重试直接取第 N
 
 ```
 web/     前端控制台 —— 零依赖、零构建步骤，详见 web/README.md
-backend/ Go 网关 —— 尚未提交
+backend/ Go 网关内核 —— 调度器 + failover，单文件
 ```
 
-## 跑前端
+## 跑起来
+
+后端（需要 Go 1.27）：
+
+```bash
+cd backend && go run .
+```
+
+前端：
 
 ```bash
 cd web && python -m http.server 8791
 ```
 
-打开 <http://127.0.0.1:8791>。后端未连接时会进入演示模式，页面顶部有明确标注。
+打开 <http://127.0.0.1:8791>。后端未连接时前端会进入演示模式，页面顶部有明确标注。
 
-## 已知边界
+## 看 failover 真的发生
 
-- 后端还没有。前端目前只连演示数据。
-- 前端是只读的，所有新建/编辑按钮都禁用，等后端接口定稿。
-- 前后端的接口契约写在 `web/README.md` 里，后端按那个形状实现即可对接。
+后端自带一个 `/mock/upstream` 假上游，它对 `acct-openai-1` 固定返回 500。所以一次普通请求就能看到横向切换：
+
+```bash
+curl -s -X POST localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[]}'
+```
+
+返回的内容会指名 `acct-openai-2` —— 也就是**同一档里的另一个账号**，而不是降级到二档的 `acct-anthropic-1`。服务端日志同时打出每次尝试：
+
+```
+attempt=0 account=acct-openai-1 -> 500
+attempt=1 account=acct-openai-2 -> 200
+```
+
+这就是第 2 节那条铁律在跑起来的样子。
+
+## 已知边界（诚实清单）
+
+- **上游是模拟的。** `/mock/upstream` 是自带的假上游，还没有接真实模型供应商。`callUpstream` 是真实 HTTP 调用，换掉 BaseURL 就能接真的。
+- **没有持久化。** 账号是 `main()` 里写死的切片，没有数据库，重启即还原。
+- **没有鉴权。** 管理接口目前裸奔，不要暴露到公网。
+- **前端只读。** 所有新建/编辑按钮都禁用，等后端写接口定稿。
+- 计费、额度、多用户后台都还没开始 —— 那是方案里的阶段 3，目前在阶段 1。

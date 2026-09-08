@@ -4,3 +4,4 @@ Thumbs.db
 *.sqlite
 .env
 node_modules/
+backend/*.exe
