@@ -71,10 +71,47 @@ attempt=1 account=acct-openai-2 -> 200
 
 这就是第 2 节那条铁律在跑起来的样子。
 
+## 用户体系
+
+两类角色，两套接口，边界是硬的：
+
+| | 谁用 | 接口 | 能看到什么 |
+|---|---|---|---|
+| 管理端 | 运维（`role=admin`） | `GET /api/*` | 全局：账号池、渠道、健康度 |
+| 用户端 | 客户（`role=user`） | `/api/console/*` | **只有自己的**：密钥、额度、调用记录 |
+
+**设计上的关键一点**：`/api/console/*` 的处理函数**从不从请求里读 user id**，只从已认证的 session 里取。所以「读别人的数据」这种请求在 API 形状上就不可表达，而不是靠某处的一个检查——那种检查总有一天会被人忘掉。
+
+实测过的隔离行为（不是声称，是跑出来的）：
+
+```
+alice 列出密钥         -> 只有 alice-prod
+bob   列出密钥         -> 只有 bob-prod
+alice 删除 bob 的密钥  -> 404 key not found
+alice 禁用 bob 的密钥  -> 404 key not found
+bob 的密钥            -> 依然存在且启用
+匿名访问 console      -> 401 not signed in
+alice 访问 /api/accounts -> 403 admin only
+admin 访问 /api/accounts -> 200
+```
+
+注意越权返回的是 **404 而不是 403**：这样连「这个 id 存不存在」都不泄露。
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `SUBPORT_ADDR` | `:8080` | 监听地址 |
+| `SUBPORT_DB` | `subport-data.json` | 数据文件 |
+| `SUBPORT_INVITE_CODE` | `subport-invite` | 注册邀请码，设为空串则开放注册 |
+| `SUBPORT_ADMIN_PASSWORD` | `subport-admin` | 首次启动创建的 admin 密码 |
+
+**首次启动会自动创建 admin 账号，默认密码 `subport-admin`——上线前必须改掉。**
+
 ## 已知边界（诚实清单）
 
-- **上游是模拟的。** `/mock/upstream` 是自带的假上游，还没有接真实模型供应商。`callUpstream` 是真实 HTTP 调用，换掉 BaseURL 就能接真的。
-- **没有持久化。** 账号是 `main()` 里写死的切片，没有数据库，重启即还原。
-- **没有鉴权。** 管理接口目前裸奔，不要暴露到公网。
-- **前端只读。** 所有新建/编辑按钮都禁用，等后端写接口定稿。
-- 计费、额度、多用户后台都还没开始 —— 那是方案里的阶段 3，目前在阶段 1。
+- **上游是模拟的。** `/mock/upstream` 是自带的假上游，还没接真实模型供应商。`callUpstream` 已经是真实 HTTP 调用，换掉 BaseURL 就能接真的。
+- **存储是 JSON 文件，不是数据库。** 单机够用、原子写入不会写坏，但没有并发事务，也扛不住多实例。`Store` 是接口层，换 Postgres 不用动 handler。
+- **密码哈希是 SHA-256 加盐，不是 bcrypt/argon2。** 标准库能做到的上限。上线前应换成 argon2id。
+- **前端只读。** 新建/编辑按钮都禁用，等接口定稿。用户端 `/console` 还在做。
+- 计费结算、发卡兑换、断流补偿都还没开始。

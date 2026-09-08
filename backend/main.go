@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -32,8 +33,21 @@ type ChatRequest struct {
 	} `json:"messages"`
 }
 type Server struct {
-	mu       sync.RWMutex
-	accounts []Account
+	mu         sync.RWMutex
+	accounts   []Account
+	store      *Store
+	inviteCode string
+}
+
+// seedAccounts is the starting pool for a fresh store. Two accounts share
+// tier 1 on purpose: that is what makes horizontal failover observable.
+func seedAccounts() []Account {
+	const base = "http://127.0.0.1:8080"
+	return []Account{
+		{ID: "acct-openai-1", Name: "OpenAI primary", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
+		{ID: "acct-openai-2", Name: "OpenAI sibling", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
+		{ID: "acct-anthropic-1", Name: "Anthropic backup", Provider: "anthropic", BaseURL: base, Priority: 2, Healthy: true},
+	}
 }
 
 type RelayError struct {
@@ -173,14 +187,66 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		jsonOut(w, map[string]string{"status": "ok"})
 	case r.URL.Path == "/v1/chat/completions" && r.Method == "POST":
 		s.chat(w, r)
+
+	case r.URL.Path == "/api/auth/register" && r.Method == "POST":
+		s.handleRegister(w, r)
+	case r.URL.Path == "/api/auth/login" && r.Method == "POST":
+		s.handleLogin(w, r)
+	case r.URL.Path == "/api/auth/logout" && r.Method == "POST":
+		s.handleLogout(w, r)
+
+	// Console = the signed-in user's own data. Scoped by session, never by
+	// an id in the URL.
+	case strings.HasPrefix(r.URL.Path, "/api/console/"):
+		s.consoleRoutes(w, r, strings.TrimPrefix(r.URL.Path, "/api/console/"))
+
+	// Admin = the operator's view of the whole system. Gated on role.
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/"):
+		if !s.requireAdmin(w, r) {
+			return
+		}
 		s.list(strings.TrimPrefix(r.URL.Path, "/api/"), w)
+
 	default:
 		http.NotFound(w, r)
 	}
 }
+
 func main() {
-	s := &Server{accounts: []Account{{ID: "acct-openai-1", Name: "OpenAI primary", Provider: "openai", BaseURL: "http://127.0.0.1:8080", Priority: 1, Healthy: true}, {ID: "acct-openai-2", Name: "OpenAI sibling", Provider: "openai", BaseURL: "http://127.0.0.1:8080", Priority: 1, Healthy: true}, {ID: "acct-anthropic-1", Name: "Anthropic backup", Provider: "anthropic", BaseURL: "http://127.0.0.1:8080", Priority: 2, Healthy: true}}}
-	log.Println("subport backend listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", s))
+	dbPath := os.Getenv("SUBPORT_DB")
+	if dbPath == "" {
+		dbPath = "subport-data.json"
+	}
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		log.Fatalf("cannot open store %s: %v", dbPath, err)
+	}
+
+	invite, set := os.LookupEnv("SUBPORT_INVITE_CODE")
+	if !set {
+		invite = "subport-invite" // invite-gated by default; set to "" to open
+	}
+
+	s := &Server{accounts: store.Accounts(), store: store, inviteCode: invite}
+
+	// Bootstrap an admin on first run so the operator can actually sign in.
+	if _, err := store.Authenticate("admin", adminBootstrapPassword()); err != nil {
+		if u, cerr := store.CreateUser("admin", adminBootstrapPassword(), "admin"); cerr == nil {
+			log.Printf("created bootstrap admin %q - change this password", u.Username)
+		}
+	}
+
+	addr := os.Getenv("SUBPORT_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+	log.Printf("subport backend listening on %s (store=%s)", addr, dbPath)
+	log.Fatal(http.ListenAndServe(addr, s))
+}
+
+func adminBootstrapPassword() string {
+	if p := os.Getenv("SUBPORT_ADMIN_PASSWORD"); p != "" {
+		return p
+	}
+	return "subport-admin"
 }
