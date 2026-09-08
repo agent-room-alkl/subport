@@ -72,6 +72,27 @@ type Account struct {
 	Consecutive403      int     `json:"consecutive_403"`
 }
 
+// CompensationConfig controls the auto-compensation engine. A stream cut is
+// billed for what was produced; when the broken rate over a window of recent
+// calls crosses Threshold, the system credits the cost back and marks each
+// broken log Compensated=true so it can never be credited twice.
+type CompensationConfig struct {
+	Threshold  float64 // e.g. 0.3 = 30% broken rate triggers compensation
+	WindowSize int     // consider the last N calls for the rate
+	MinBroken  int     // at least this many broken calls to trigger (avoid 1-off noise)
+}
+
+// CompensationResult is what CompensateBrokenStreams returns, so the caller
+// (and the admin view) can report what happened.
+type CompensationResult struct {
+	Triggered        bool    `json:"triggered"`
+	BrokenCount      int     `json:"broken_count"`
+	TotalCount       int     `json:"total_count"`
+	Rate             float64 `json:"rate"`
+	Credited         int64   `json:"credited"`
+	CompensatedCount int     `json:"compensated_count"`
+}
+
 // PublicUser strips the password hash and salt. Never serialise User directly.
 func PublicUser(u User) map[string]any {
 	return map[string]any{

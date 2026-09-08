@@ -67,6 +67,20 @@ func (s *Scheduler) Accounts() []model.Account {
 	return out
 }
 
+// SetAccountHealth updates an account's Healthy flag in the scheduler's
+// in-memory copy. The store holds the authoritative state; this mirrors it
+// so the scheduler's Pick() sees the change without a restart.
+func (s *Scheduler) SetAccountHealth(id string, healthy bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.accounts {
+		if s.accounts[i].ID == id {
+			s.accounts[i].Healthy = healthy
+			return
+		}
+	}
+}
+
 // Pick returns the account for the given attempt index. Attempts walk healthy
 // accounts tier by tier, exhausting each tier horizontally before descending -
 // attempt 0 and 1 are peers in tier 1 before attempt 2 reaches tier 2.
@@ -117,11 +131,23 @@ func CallUpstream(a model.Account, req ChatRequest) (string, error) {
 	var out struct {
 		Content string `json:"content"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	decodeErr := json.NewDecoder(resp.Body).Decode(&out)
 	if resp.StatusCode >= 300 {
 		return "", RelayError{
 			Err:           fmt.Errorf("upstream status %d", resp.StatusCode),
 			FirstByteSent: false,
+		}
+	}
+	if decodeErr != nil {
+		// The upstream sent a 200 (so the connection was established and
+		// output began) but the body was truncated — the stream was cut
+		// after the first byte. This is exactly the stream-broken case:
+		// the client may have received partial output, so the call is
+		// billed for what was produced and marked for compensation, not
+		// retried on another account.
+		return "", RelayError{
+			Err:           fmt.Errorf("stream truncated: %v", decodeErr),
+			FirstByteSent: true,
 		}
 	}
 	return out.Content, nil

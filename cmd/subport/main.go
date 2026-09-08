@@ -7,9 +7,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/agent-room-alkl/subport/internal/gateway"
 	"github.com/agent-room-alkl/subport/internal/httpapi"
+	"github.com/agent-room-alkl/subport/internal/model"
 	"github.com/agent-room-alkl/subport/internal/store"
 )
 
@@ -50,7 +52,33 @@ func main() {
 	}
 
 	sched := gateway.NewScheduler(st.Accounts())
-	srv := httpapi.New(st, sched, invite, env("SUBPORT_WEB", "web"))
+
+	// Compensation config: when a user's stream_broken rate over a window
+	// crosses the threshold, the cost of broken calls is credited back.
+	// Defaults are conservative: 30% broken rate over the last 10 calls,
+	// with at least 2 broken calls to trigger (avoids 1-off noise).
+	compCfg := model.CompensationConfig{
+		Threshold:  0.3,
+		WindowSize: 10,
+		MinBroken:  2,
+	}
+	if v := os.Getenv("SUBPORT_COMP_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			compCfg.Threshold = f
+		}
+	}
+	if v := os.Getenv("SUBPORT_COMP_WINDOW"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			compCfg.WindowSize = n
+		}
+	}
+	if v := os.Getenv("SUBPORT_COMP_MIN_BROKEN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			compCfg.MinBroken = n
+		}
+	}
+
+	srv := httpapi.New(st, sched, invite, env("SUBPORT_WEB", "web"), compCfg)
 
 	log.Printf("subport listening on %s (store=%s, self=%s)", addr, dbPath, selfURL)
 	log.Fatal(http.ListenAndServe(addr, srv))

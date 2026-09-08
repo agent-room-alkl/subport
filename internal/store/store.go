@@ -35,6 +35,13 @@ func seedAccounts(base string) []model.Account {
 		{ID: "acct-openai-1", Name: "OpenAI primary", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
 		{ID: "acct-openai-2", Name: "OpenAI sibling", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
 		{ID: "acct-anthropic-1", Name: "Anthropic backup", Provider: "anthropic", BaseURL: base, Priority: 2, Healthy: true},
+		// acct-stream-break simulates a mid-stream cut: the mock upstream
+		// sends a 200 + partial JSON then closes the connection. This is
+		// how stream_broken usage logs are produced end-to-end for the
+		// compensation proof. In a real deployment this account would not
+		// exist — a real upstream that cuts mid-stream produces the same
+		// code path through CallUpstream's truncated-body detection.
+		{ID: "acct-stream-break", Name: "Stream break test", Provider: "openai", BaseURL: base, Priority: 3, Healthy: true},
 	}
 }
 
@@ -404,4 +411,97 @@ func (s *Store) SetAccountHealthy(id string, healthy bool) error {
 		}
 	}
 	return ErrNotFound
+}
+
+// ---------------------------------------------------------------- compensation
+
+// CompensateBrokenStreams is the auto-compensation engine. It looks at a
+// user's recent calls (the last WindowSize), and if the stream_broken rate
+// crosses Threshold with at least MinBroken broken calls, it credits the
+// total cost of uncompensated broken calls back to the user's quota and
+// marks each one Compensated=true. Running it again on already-compensated
+// logs credits nothing — the compensated flag is the idempotency guard.
+func (s *Store) CompensateBrokenStreams(userID string, cfg model.CompensationConfig) (model.CompensationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Collect the user's recent calls, most-recent-first.
+	var recent []model.UsageLog
+	for i := len(s.d.Usage) - 1; i >= 0 && len(recent) < cfg.WindowSize; i-- {
+		if s.d.Usage[i].UserID == userID {
+			recent = append(recent, s.d.Usage[i])
+		}
+	}
+
+	result := model.CompensationResult{
+		TotalCount:  len(recent),
+		BrokenCount: 0,
+	}
+	for _, l := range recent {
+		if l.StreamBroken {
+			result.BrokenCount++
+		}
+	}
+	if result.TotalCount > 0 {
+		result.Rate = float64(result.BrokenCount) / float64(result.TotalCount)
+	}
+
+	// Guard: not enough broken calls to trust the rate.
+	if result.BrokenCount < cfg.MinBroken {
+		return result, nil
+	}
+	// Guard: rate below threshold — don't compensate yet.
+	if result.Rate < cfg.Threshold {
+		return result, nil
+	}
+
+	// Gather uncompensated broken logs and their total cost.
+	var credit int64
+	compensatedIDs := map[string]bool{}
+	for _, l := range recent {
+		if l.StreamBroken && !l.Compensated {
+			credit += l.Cost
+			compensatedIDs[l.ID] = true
+		}
+	}
+
+	// Set compensated=true on each broken log that was credited.
+	for i := range s.d.Usage {
+		if compensatedIDs[s.d.Usage[i].ID] {
+			s.d.Usage[i].Compensated = true
+		}
+	}
+
+	// Credit the user's quota_used back.
+	for i := range s.d.Users {
+		if s.d.Users[i].ID == userID {
+			s.d.Users[i].QuotaUsed -= credit
+			if s.d.Users[i].QuotaUsed < 0 {
+				s.d.Users[i].QuotaUsed = 0
+			}
+		}
+	}
+
+	result.Triggered = true
+	result.Credited = credit
+	result.CompensatedCount = len(compensatedIDs)
+	return result, s.flush()
+}
+
+// Compensations returns all stream_broken usage logs, for the admin view.
+// Pending = not yet compensated; Completed = compensated.
+func (s *Store) Compensations() (pending, completed []model.UsageLog) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, l := range s.d.Usage {
+		if !l.StreamBroken {
+			continue
+		}
+		if l.Compensated {
+			completed = append(completed, l)
+		} else {
+			pending = append(pending, l)
+		}
+	}
+	return pending, completed
 }

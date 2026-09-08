@@ -120,6 +120,26 @@ admin 访问 /api/accounts -> 200
 
 **首次启动会自动创建 admin 账号，默认密码 `subport-admin`——上线前必须改掉。**
 
+### 断流补偿
+
+断流按已产出计费并标记 `stream_broken`。当用户的断流率在最近调用窗口内超过阈值时，系统自动把断流调用的费用退回，并在 `usage_log` 上置 `compensated=true`（幂等，不会重复退）。
+
+补偿配置：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `SUBPORT_COMP_THRESHOLD` | `0.3` | 断流率阈值（0.3 = 30%），超过即触发补偿 |
+| `SUBPORT_COMP_WINDOW` | `10` | 计算断流率的窗口大小（最近 N 次调用） |
+| `SUBPORT_COMP_MIN_BROKEN` | `2` | 至少 N 次断流才触发（避免单次噪音） |
+
+管理员接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/compensations` | 查看待处理（pending）和已完成（completed）的补偿记录 |
+| `POST` | `/api/compensate` | 手动触发某个用户的补偿（body: `{"user_id":"..."}`） |
+| `PATCH` | `/api/accounts/:id` | 设置账号健康度（body: `{"healthy":false}`） |
+
 ## 网关鉴权与计费
 
 `/v1/chat/completions` **必须带有效的 API Key**，否则 401：
@@ -144,4 +164,4 @@ admin 访问 /api/accounts -> 200
 - **存储是 JSON 文件，不是数据库。** 单机够用、原子写入不会写坏，但没有并发事务，也扛不住多实例。`Store` 是接口层，换 Postgres 不用动 handler。
 - **密码哈希是 SHA-256 加盐，不是 bcrypt/argon2。** 标准库能做到的上限。上线前应换成 argon2id。
 - **前端只读。** 新建/编辑按钮都禁用，等接口定稿。用户端 `/console` 还在做。
-- 计费结算、发卡兑换、断流补偿都还没开始。
+- 计费结算、发卡兑换还没开始。断流补偿已实现（见上方「断流补偿」）。
