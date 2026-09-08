@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -138,11 +139,22 @@ func hashWithSalt(secret, salt string) string {
 
 // ---------------------------------------------------------------- users
 
+// normUsername folds case and trims space. Usernames are compared on this
+// form so that "Admin" cannot be registered alongside "admin" - otherwise a
+// user could pick a name that reads as the operator's in any listing.
+func normUsername(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
 func (s *Store) CreateUser(username, password, role string) (User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	username = normUsername(username)
+	if username == "" {
+		return User{}, errors.New("username is required")
+	}
 	for _, u := range s.d.Users {
-		if u.Username == username {
+		if normUsername(u.Username) == username {
 			return User{}, errors.New("username already taken")
 		}
 	}
@@ -165,8 +177,9 @@ func (s *Store) CreateUser(username, password, role string) (User, error) {
 func (s *Store) Authenticate(username, password string) (User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	username = normUsername(username)
 	for _, u := range s.d.Users {
-		if u.Username == username && u.PasswordHash == hashWithSalt(password, u.Salt) {
+		if normUsername(u.Username) == username && u.PasswordHash == hashWithSalt(password, u.Salt) {
 			return u, nil
 		}
 	}
