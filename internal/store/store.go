@@ -75,6 +75,10 @@ func OpenStore(path, seedBaseURL string) (*Store, error) {
 			_ = db.Close()
 			return nil, err
 		}
+		if err := s.sqliteEnsureAccounts(s.d.Accounts); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 		return s, nil
 	}
 	if !os.IsNotExist(err) {
@@ -82,6 +86,10 @@ func OpenStore(path, seedBaseURL string) (*Store, error) {
 		return nil, err
 	}
 	s.d = data{Accounts: seedAccounts(seedBaseURL)}
+	if err := s.sqliteEnsureAccounts(s.d.Accounts); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return s, s.flush()
 }
 
@@ -430,6 +438,11 @@ func (s *Store) AddUsage(l model.UsageLog) error {
 func (s *Store) Accounts() []model.Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.db != nil {
+		if out, err := s.sqliteAccounts(); err == nil {
+			return out
+		}
+	}
 	out := make([]model.Account, len(s.d.Accounts))
 	copy(out, s.d.Accounts)
 	return out
@@ -438,6 +451,9 @@ func (s *Store) Accounts() []model.Account {
 func (s *Store) SetAccountHealthy(id string, healthy bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		return s.sqliteSetAccountHealthy(id, healthy)
+	}
 	for i := range s.d.Accounts {
 		if s.d.Accounts[i].ID == id {
 			s.d.Accounts[i].Healthy = healthy
