@@ -37,7 +37,7 @@ new-api 原生的重试是「逐档下降」—— 第 N 次重试直接取第 N
 cmd/subport/           入口，只做装配
 internal/
   model/               共享类型：User APIKey UsageLog Session Account
-  store/               持久化 ← 换 SQLite 只动这一个目录
+  store/               持久化（SQLite）← 换存储只动这一个目录
   gateway/             调度器 + failover + relay ← 项目的核心
   httpapi/             路由 + 鉴权 + 用户维度隔离的 console 接口
 web/
@@ -49,7 +49,7 @@ docs/                  MERGE_REPORT.md 等分析产物
 
 **三个端共用一套后端、一个域名，按路由分**，不是三个项目。拆开只会换来跨域、三套鉴权、三份部署，安全边界靠的是角色和数据过滤，不是仓库数量。
 
-`internal/` 不是命名约定——Go 编译器会阻止外部模块 import 它。`store/` 独立成包是为了 SQLite 迁移时 `gateway/` 和 `httpapi/` 一行都不用动。
+`internal/` 不是命名约定——Go 编译器会阻止外部模块 import 它。`store/` 独立成包，是为了换存储时 `gateway/` 和 `httpapi/` 一行都不用动。**这一条已经被验证过两次**：迁到 SQLite、以及后来拆掉 JSON 双写，两次的 diff 都只落在 `internal/store/`。
 
 ## 跑起来
 
@@ -114,7 +114,7 @@ admin 访问 /api/accounts -> 200
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `SUBPORT_DB` | `subport-data.json` | 数据文件 |
+| `SUBPORT_DB` | `subport-data.json` | 数据库路径的基名；实际文件是 `<它>.sqlite`。同名的旧 JSON 文件若存在会被**一次性导入**后不再写入 |
 | `SUBPORT_INVITE_CODE` | `subport-invite` | 注册邀请码，设为空串则开放注册。注册接口 `invite_code` 和 `inviteCode` 两种写法都收 |
 | `SUBPORT_ADMIN_PASSWORD` | `subport-admin` | 首次启动创建的 admin 密码 |
 
@@ -161,7 +161,8 @@ admin 访问 /api/accounts -> 200
 
 - **上游是模拟的。** `/mock/upstream` 是自带的假上游，还没接真实模型供应商。`callUpstream` 已经是真实 HTTP 调用，换掉 BaseURL 就能接真的。
 - **计费按响应字符数估算**，不是真实 token 数。接上真实上游后应改用上游返回的 usage。
-- **存储是 JSON 文件，不是数据库。** 单机够用、原子写入不会写坏，但没有并发事务，也扛不住多实例。`Store` 是接口层，换 Postgres 不用动 handler。
+- **存储是 SQLite**（`modernc.org/sqlite`，纯 Go 无需 CGO），只有这一条写入路径。早先的 JSON 双写已经拆掉——两个写者两份状态、没有东西保证它们相等，正是存储层该防的事。`Store` 是接口层：换 SQLite 时 `gateway/` 和 `httpapi/` 一行都没动，换 Postgres 同理。
+- **单机 SQLite，还不是多实例。** 事务和并发有了，但多进程共享同一个文件仍不合适；要横向扩就得换 Postgres。
 - **密码哈希是 SHA-256 加盐，不是 bcrypt/argon2。** 标准库能做到的上限。上线前应换成 argon2id。
 - **前端只读。** 新建/编辑按钮都禁用，等接口定稿。用户端 `/console` 还在做。
 - 计费结算、发卡兑换还没开始。断流补偿已实现（见上方「断流补偿」）。
