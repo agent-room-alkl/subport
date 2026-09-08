@@ -8,6 +8,7 @@ package store
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -49,18 +50,28 @@ type Store struct {
 	mu   sync.RWMutex
 	path string
 	d    data
+	db   *sql.DB
 }
 
 func OpenStore(path, seedBaseURL string) (*Store, error) {
+	// Keep the existing JSON snapshot as the migration source of truth while
+	// every store now boots the SQLite schema. CRUD migration follows in T-12B-E.
 	s := &Store{path: path}
+	db, err := openSQLite(path + ".sqlite")
+	if err != nil {
+		return nil, err
+	}
+	s.db = db
 	b, err := os.ReadFile(path)
 	if err == nil {
 		if err := json.Unmarshal(b, &s.d); err != nil {
+			_ = db.Close()
 			return nil, err
 		}
 		return s, nil
 	}
 	if !os.IsNotExist(err) {
+		_ = db.Close()
 		return nil, err
 	}
 	s.d = data{Accounts: seedAccounts(seedBaseURL)}
