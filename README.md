@@ -103,7 +103,7 @@ admin 访问 /api/accounts -> 200
 |---|---|---|
 | `SUBPORT_ADDR` | `:8080` | 监听地址 |
 | `SUBPORT_DB` | `subport-data.json` | 数据文件 |
-| `SUBPORT_INVITE_CODE` | `subport-invite` | 注册邀请码，设为空串则开放注册 |
+| `SUBPORT_INVITE_CODE` | `subport-invite` | 注册邀请码，设为空串则开放注册。注册接口 `invite_code` 和 `inviteCode` 两种写法都收 |
 | `SUBPORT_ADMIN_PASSWORD` | `subport-admin` | 首次启动创建的 admin 密码 |
 
 **首次启动会自动创建 admin 账号，默认密码 `subport-admin`——上线前必须改掉。**

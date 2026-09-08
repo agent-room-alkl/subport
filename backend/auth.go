@@ -47,8 +47,27 @@ func fail(w http.ResponseWriter, code int, msg string) {
 
 // ---------------------------------------------------------------- auth routes
 
+// registerInput accepts the invite code under both spellings. Every response
+// this API emits is snake_case, so a client will reasonably send invite_code;
+// encoding/json matches field names case-insensitively but an underscore is
+// not ignored, so "invite_code" would silently arrive empty and the request
+// would fail as "invalid invite code" with no hint why. Accept both.
+type registerInput struct {
+	Username        string `json:"username"`
+	Password        string `json:"password"`
+	InviteCodeSnake string `json:"invite_code"`
+	InviteCodeCamel string `json:"inviteCode"`
+}
+
+func (in registerInput) invite() string {
+	if in.InviteCodeSnake != "" {
+		return in.InviteCodeSnake
+	}
+	return in.InviteCodeCamel
+}
+
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Username, Password, InviteCode string }
+	var in registerInput
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		fail(w, 400, "bad request")
 		return
@@ -59,7 +78,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// Invite-gated by default so a fresh deployment cannot be mass-registered.
 	// Set SUBPORT_INVITE_CODE="" to open registration.
-	if s.inviteCode != "" && in.InviteCode != s.inviteCode {
+	if s.inviteCode != "" && in.invite() != s.inviteCode {
 		fail(w, 403, "invalid invite code")
 		return
 	}
@@ -77,7 +96,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Username, Password string }
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		fail(w, 400, "bad request")
 		return
