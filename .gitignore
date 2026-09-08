@@ -1,9 +1,7 @@
+*.exe
+subport-data.json
+*.db
 .DS_Store
 Thumbs.db
-*.db
-*.sqlite
 .env
 node_modules/
-backend/*.exe
-backend/subport-data.json
-backend/*.json

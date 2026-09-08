@@ -14,7 +14,7 @@ Agent 账号转 API 的网关。目标是**稳定** —— 不要总是断。
 | [sub2api](https://github.com/Wei-Shaw/sub2api) | 零件。账号级健康度体系、OAuth token 主动刷新流水线、首字节超时 |
 | 自研 | 把「账号」和「渠道」两套健康度焊成一张统一调度表；断流的判定与补偿 |
 
-完整的对比分析、逐维取舍裁决和分阶段方案见仓库外的 `MERGE_REPORT.md`（分析产物，尚未纳入本仓库）。
+完整的对比分析、逐维取舍裁决和分阶段方案见 [`docs/MERGE_REPORT.md`](docs/MERGE_REPORT.md)。
 
 ## 两条设计铁律
 
@@ -34,27 +34,38 @@ new-api 原生的重试是「逐档下降」—— 第 N 次重试直接取第 N
 ## 目录
 
 ```
-web/               前端控制台 —— 零依赖、零构建步骤，详见 web/README.md
-backend/main.go    路由、调度器、failover、relay
-backend/store.go   持久化：user / api_key / usage_log / session / account
-backend/auth.go    注册登录、角色、用户维度隔离的 console 接口
+cmd/subport/           入口，只做装配
+internal/
+  model/               共享类型：User APIKey UsageLog Session Account
+  store/               持久化 ← 换 SQLite 只动这一个目录
+  gateway/             调度器 + failover + relay ← 项目的核心
+  httpapi/             路由 + 鉴权 + 用户维度隔离的 console 接口
+web/
+  shared/app.css       两个端共用的样式
+  admin/               管理端（运维用）
+  console/             用户端（客户用，开发中）
+docs/                  MERGE_REPORT.md 等分析产物
 ```
+
+**三个端共用一套后端、一个域名，按路由分**，不是三个项目。拆开只会换来跨域、三套鉴权、三份部署，安全边界靠的是角色和数据过滤，不是仓库数量。
+
+`internal/` 不是命名约定——Go 编译器会阻止外部模块 import 它。`store/` 独立成包是为了 SQLite 迁移时 `gateway/` 和 `httpapi/` 一行都不用动。
 
 ## 跑起来
 
-后端（需要 Go 1.27）：
+需要 Go 1.27。一条命令，前后端一起起来：
 
 ```bash
-cd backend && go run .
+go run ./cmd/subport
 ```
 
-前端：
+打开 <http://127.0.0.1:8080/admin/index.html>。后端会同时托管静态前端，不需要另起 web server。
 
-```bash
-cd web && python -m http.server 8791
-```
-
-打开 <http://127.0.0.1:8791>。后端未连接时前端会进入演示模式，页面顶部有明确标注。
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `SUBPORT_ADDR` | `:8080` | 监听地址 |
+| `SUBPORT_SELF_URL` | 由 ADDR 推导 | 演示上游的地址；不要写死端口 |
+| `SUBPORT_WEB` | `web` | 静态资源目录 |
 
 ## 看 failover 真的发生
 
@@ -103,7 +114,6 @@ admin 访问 /api/accounts -> 200
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `SUBPORT_ADDR` | `:8080` | 监听地址 |
 | `SUBPORT_DB` | `subport-data.json` | 数据文件 |
 | `SUBPORT_INVITE_CODE` | `subport-invite` | 注册邀请码，设为空串则开放注册。注册接口 `invite_code` 和 `inviteCode` 两种写法都收 |
 | `SUBPORT_ADMIN_PASSWORD` | `subport-admin` | 首次启动创建的 admin 密码 |
