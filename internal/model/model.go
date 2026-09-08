@@ -6,14 +6,18 @@ package model
 import "time"
 
 type User struct {
-	ID           string    `json:"id"`
-	Username     string    `json:"username"`
-	PasswordHash string    `json:"password_hash"`
-	Salt         string    `json:"salt"`
-	Role         string    `json:"role"` // "admin" | "user"
-	QuotaTotal   int64     `json:"quota_total"`
-	QuotaUsed    int64     `json:"quota_used"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID           string `json:"id"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+	Salt         string `json:"salt"`
+	Role         string `json:"role"` // "admin" | "user"
+	QuotaTotal   int64  `json:"quota_total"`
+	QuotaUsed    int64  `json:"quota_used"`
+	// QuotaReserved is quota held by requests that are still in flight. It is
+	// admission state, not a bill: it rises when a request is let in and falls
+	// again when that request settles or fails. Only quota_used is money.
+	QuotaReserved int64     `json:"quota_reserved"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 const (

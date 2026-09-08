@@ -179,24 +179,6 @@ func (s *Store) sqliteUsageOf(userID string, limit int) ([]model.UsageLog, error
 	return out, rows.Err()
 }
 
-func (s *Store) sqliteAddUsage(l model.UsageLog) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(
-		`INSERT INTO usage_logs(id,user_id,key_id,model,tokens,cost,status,account_id,attempts,stream_broken,compensated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		l.ID, l.UserID, l.KeyID, l.Model, l.Tokens, l.Cost, l.Status, l.AccountID, l.Attempts, boolInt(l.StreamBroken), boolInt(l.Compensated), l.CreatedAt.Format(time.RFC3339Nano),
-	); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE users SET quota_used = quota_used + ? WHERE id=?`, l.Cost, l.UserID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 func (s *Store) sqliteMarkUsageCompensated(ids []string) error {
 	for _, id := range ids {
 		if _, err := s.db.Exec(`UPDATE usage_logs SET compensated=1 WHERE id=?`, id); err != nil {

@@ -10,7 +10,7 @@ import (
 func scanSQLiteUser(row *sql.Row) (model.User, error) {
 	var u model.User
 	var created string
-	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Salt, &u.Role, &u.QuotaTotal, &u.QuotaUsed, &created)
+	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Salt, &u.Role, &u.QuotaTotal, &u.QuotaUsed, &u.QuotaReserved, &created)
 	if err != nil {
 		return u, err
 	}
@@ -24,11 +24,11 @@ func (s *Store) sqliteCreateUser(u model.User) error {
 }
 
 func (s *Store) sqliteUserByName(username string) (model.User, error) {
-	return scanSQLiteUser(s.db.QueryRow(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,created_at FROM users WHERE username=?`, username))
+	return scanSQLiteUser(s.db.QueryRow(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,quota_reserved,created_at FROM users WHERE username=?`, username))
 }
 
 func (s *Store) sqliteUserByID(id string) (model.User, error) {
-	return scanSQLiteUser(s.db.QueryRow(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,created_at FROM users WHERE id=?`, id))
+	return scanSQLiteUser(s.db.QueryRow(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,quota_reserved,created_at FROM users WHERE id=?`, id))
 }
 
 func (s *Store) sqliteNewSession(sess model.Session) error {

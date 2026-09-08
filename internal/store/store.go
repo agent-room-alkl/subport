@@ -336,15 +336,65 @@ func (s *Store) UsageOf(userID string, limit int) []model.UsageLog {
 	return logs
 }
 
-func (s *Store) AddUsage(l model.UsageLog) error {
+// ReserveQuota admits a request by holding `amount` of the user's quota before
+// the upstream call, and returns ErrQuotaExhausted when it does not fit.
+//
+// Every caller that reserves MUST later either SettleUsage with the same
+// amount or ReleaseQuota it. A reservation that is never resolved is quota the
+// user has silently lost.
+func (s *Store) ReserveQuota(userID string, amount int64) error {
+	if amount <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sqliteReserveQuota(userID, amount)
+}
+
+// SetQuotaTotal changes a user's allowance. A total of 0 or less means
+// unlimited, which is the convention the admission SQL already encodes.
+func (s *Store) SetQuotaTotal(userID string, total int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`UPDATE users SET quota_total = ? WHERE id=?`, total, userID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ReleaseQuota returns a hold for a request that will never be billed - the
+// upstream refused, the client vanished, the handler panicked.
+func (s *Store) ReleaseQuota(userID string, amount int64) error {
+	if amount <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sqliteReleaseQuota(userID, amount)
+}
+
+// SettleUsage records a completed call and closes out its reservation: the log
+// row, the real charge, and the release all commit together. Pass reserved=0
+// when the call was never admitted through ReserveQuota.
+func (s *Store) SettleUsage(l model.UsageLog, reserved int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	l.ID = NewID("use")
 	l.CreatedAt = time.Now().UTC()
-	// The insert and the quota increment share one transaction, so a crash
-	// cannot bill a user for a call that was never recorded.
-	return s.sqliteAddUsage(l)
+	return s.sqliteSettleUsage(l, reserved)
+}
+
+// AddUsage bills a call that held no reservation. It is SettleUsage with
+// nothing to release rather than a second write path: two ways to write the
+// same state is how the two halves drift apart, which is the whole reason the
+// JSON mirror was removed.
+func (s *Store) AddUsage(l model.UsageLog) error {
+	return s.SettleUsage(l, 0)
 }
 
 // ---------------------------------------------------------------- accounts
