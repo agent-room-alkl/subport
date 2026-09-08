@@ -40,18 +40,25 @@ type APIKey struct {
 // day one so the stream-break billing policy can be decided later without a
 // migration - see docs/MERGE_REPORT.md on pre-consume/settle/refund.
 type UsageLog struct {
-	ID           string    `json:"id"`
-	UserID       string    `json:"user_id"`
-	KeyID        string    `json:"key_id"`
-	Model        string    `json:"model"`
-	AccountID    string    `json:"account_id"`
-	Tokens       int64     `json:"tokens"`
-	Cost         int64     `json:"cost"`
-	Status       string    `json:"status"` // success | failed | stream_broken
-	StreamBroken bool      `json:"stream_broken"`
-	Compensated  bool      `json:"compensated"`
-	Attempts     int       `json:"attempts"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID        string `json:"id"`
+	UserID    string `json:"user_id"`
+	KeyID     string `json:"key_id"`
+	Model     string `json:"model"`
+	AccountID string `json:"account_id"`
+	Tokens    int64  `json:"tokens"`
+	// TokenParts is the per-class breakdown when the provider reported one.
+	// All-zero parts mean "no breakdown available", not "no tokens"; Tokens
+	// stays authoritative in that case.
+	TokenParts TokenCounts `json:"token_parts"`
+	// BilledAt is the rate card this row was actually charged at, copied in
+	// full rather than referenced. See BilledRate.
+	BilledAt     BilledRate `json:"billed_at"`
+	Cost         int64      `json:"cost"`
+	Status       string     `json:"status"` // success | failed | stream_broken
+	StreamBroken bool       `json:"stream_broken"`
+	Compensated  bool       `json:"compensated"`
+	Attempts     int        `json:"attempts"`
+	CreatedAt    time.Time  `json:"created_at"`
 }
 
 type Session struct {

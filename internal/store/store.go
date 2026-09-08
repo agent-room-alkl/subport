@@ -474,3 +474,80 @@ func (s *Store) Compensations() (pending, completed []model.UsageLog) {
 	}
 	return p, c
 }
+
+// ---------------------------------------------------------------- pricing
+
+// SetModelPrice writes or replaces one model's rate card.
+func (s *Store) SetModelPrice(p model.ModelPrice) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sqliteSetModelPrice(p)
+}
+
+// ModelPrice returns a model's rate card, or ErrNotFound.
+func (s *Store) ModelPrice(name string) (model.ModelPrice, error) {
+	return s.sqliteModelPrice(name)
+}
+
+// ModelPrices lists the whole price list.
+func (s *Store) ModelPrices() []model.ModelPrice {
+	out, err := s.sqliteModelPrices()
+	if err != nil {
+		return []model.ModelPrice{}
+	}
+	return out
+}
+
+// SetGroupRatio sets a billing group's multiplier, in RatioScale units.
+func (s *Store) SetGroupRatio(name string, ratio int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sqliteSetGroupRatio(name, ratio)
+}
+
+// SetUserBilling puts a user in a billing group, optionally with a personal
+// override. Pass override 0 to mean "no override" - a real 0x ratio would be
+// free, which must be spelled out deliberately rather than fallen into.
+func (s *Store) SetUserBilling(userID, group string, override int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sqliteSetUserBilling(userID, group, override)
+}
+
+// EffectiveRatio resolves what a user is actually charged at.
+//
+// Order is: personal override, then their group, then list price. A missing
+// group is list price, NOT free: a typo in a group name must cost the customer
+// nothing and cost us nothing either.
+func (s *Store) EffectiveRatio(userID string) int64 {
+	group, override, err := s.sqliteUserBilling(userID)
+	if err != nil {
+		return DefaultRatio
+	}
+	if override > 0 {
+		return override
+	}
+	if group == "" {
+		return DefaultRatio
+	}
+	ratio, err := s.sqliteGroupRatio(group)
+	if err != nil || ratio <= 0 {
+		return DefaultRatio
+	}
+	return ratio
+}
+
+// PriceCall works out what a call costs and the snapshot to record with it.
+//
+// The snapshot is returned alongside the cost, not looked up again at write
+// time, so the number billed and the number explaining it can never disagree.
+// A model with no rate card falls back to flat 1:1, which is what billing did
+// before any of this existed - unpriced must not mean free.
+func (s *Store) PriceCall(userID, modelName string, counts model.TokenCounts) (int64, model.BilledRate) {
+	price, err := s.sqliteModelPrice(modelName)
+	if err != nil {
+		price = model.FlatPrice(modelName, model.RateScale)
+	}
+	rate := model.RateFor(price, s.EffectiveRatio(userID))
+	return model.Cost(counts, rate), rate
+}

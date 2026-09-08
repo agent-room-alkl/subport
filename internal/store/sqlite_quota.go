@@ -86,8 +86,13 @@ func (s *Store) sqliteSettleUsage(l model.UsageLog, reserved int64) error {
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.Exec(
-		`INSERT INTO usage_logs(id,user_id,key_id,model,tokens,cost,status,account_id,attempts,stream_broken,compensated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO usage_logs(id,user_id,key_id,model,tokens,cost,status,account_id,attempts,stream_broken,compensated,created_at,`+
+			`tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,`+
+			`rate_input,rate_output,rate_cache_read,rate_cache_write,rate_ratio) `+
+			`VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		l.ID, l.UserID, l.KeyID, l.Model, l.Tokens, l.Cost, l.Status, l.AccountID, l.Attempts, boolInt(l.StreamBroken), boolInt(l.Compensated), l.CreatedAt.Format(time.RFC3339Nano),
+		l.TokenParts.Input, l.TokenParts.Output, l.TokenParts.CacheRead, l.TokenParts.CacheWrite,
+		l.BilledAt.Input, l.BilledAt.Output, l.BilledAt.CacheRead, l.BilledAt.CacheWrite, l.BilledAt.Ratio,
 	); err != nil {
 		return err
 	}

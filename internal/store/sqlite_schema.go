@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS usage_logs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, key_id TEXT NOT NULL, model TEXT NOT NULL, tokens INTEGER NOT NULL, cost INTEGER NOT NULL, status TEXT NOT NULL, account_id TEXT NOT NULL, attempts INTEGER NOT NULL, stream_broken INTEGER NOT NULL DEFAULT 0, compensated INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL, base_url TEXT NOT NULL, priority INTEGER NOT NULL, healthy INTEGER NOT NULL, load REAL NOT NULL, cooldown_until TEXT NOT NULL, last_error TEXT NOT NULL, consecutive_timeouts INTEGER NOT NULL, consecutive_403 INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS model_prices (model TEXT PRIMARY KEY, rate_input INTEGER NOT NULL, rate_output INTEGER NOT NULL, rate_cache_read INTEGER NOT NULL, rate_cache_write INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS billing_groups (name TEXT PRIMARY KEY, ratio INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_keys_user ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_logs(user_id, created_at);
 `
@@ -46,6 +48,28 @@ func openSQLite(path string) (*sql.DB, error) {
 	if err = softAddColumn(db, `ALTER TABLE users ADD COLUMN quota_reserved INTEGER NOT NULL DEFAULT 0`); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+
+	// Token classes and the rate SNAPSHOT each row was billed at. The snapshot
+	// is the point: a bill is a statement about the past, so editing the price
+	// list today must not rewrite invoices issued last month.
+	for _, stmt := range []string{
+		`ALTER TABLE usage_logs ADD COLUMN tokens_input INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN tokens_output INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN rate_input INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN rate_output INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN rate_cache_read INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN rate_cache_write INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN rate_ratio INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE users ADD COLUMN billing_group TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN ratio_override INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if err = softAddColumn(db, stmt); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 
 	// Reservations are in-flight state, and nothing is in flight while this

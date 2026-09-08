@@ -27,10 +27,13 @@ func scanSQLiteUsage(rows interface{ Scan(...any) error }) (model.UsageLog, erro
 	var l model.UsageLog
 	var streamBroken, compensated int
 	var created string
-	err := rows.Scan(&l.ID, &l.UserID, &l.KeyID, &l.Model, &l.Tokens, &l.Cost, &l.Status, &l.AccountID, &l.Attempts, &streamBroken, &compensated, &created)
+	err := rows.Scan(&l.ID, &l.UserID, &l.KeyID, &l.Model, &l.Tokens, &l.Cost, &l.Status, &l.AccountID, &l.Attempts, &streamBroken, &compensated, &created,
+		&l.TokenParts.Input, &l.TokenParts.Output, &l.TokenParts.CacheRead, &l.TokenParts.CacheWrite,
+		&l.BilledAt.Input, &l.BilledAt.Output, &l.BilledAt.CacheRead, &l.BilledAt.CacheWrite, &l.BilledAt.Ratio)
 	if err != nil {
 		return l, err
 	}
+	l.TokenParts.Total = l.Tokens
 	l.StreamBroken = streamBroken != 0
 	l.Compensated = compensated != 0
 	l.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
@@ -161,7 +164,7 @@ func (s *Store) sqliteDeleteKey(userID, keyID string) error {
 
 func (s *Store) sqliteUsageOf(userID string, limit int) ([]model.UsageLog, error) {
 	rows, err := s.db.Query(
-		`SELECT id,user_id,key_id,model,tokens,cost,status,account_id,attempts,stream_broken,compensated,created_at FROM usage_logs WHERE user_id=? ORDER BY created_at DESC LIMIT ?`,
+		`SELECT id,user_id,key_id,model,tokens,cost,status,account_id,attempts,stream_broken,compensated,created_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,rate_input,rate_output,rate_cache_read,rate_cache_write,rate_ratio FROM usage_logs WHERE user_id=? ORDER BY created_at DESC LIMIT ?`,
 		userID, limit,
 	)
 	if err != nil {
@@ -195,7 +198,7 @@ func (s *Store) sqliteCreditQuota(userID string, credit int64) error {
 
 func (s *Store) sqliteCompensations() (pending, completed []model.UsageLog, err error) {
 	rows, err := s.db.Query(
-		`SELECT id,user_id,key_id,model,tokens,cost,status,account_id,attempts,stream_broken,compensated,created_at FROM usage_logs WHERE stream_broken=1 ORDER BY created_at DESC`,
+		`SELECT id,user_id,key_id,model,tokens,cost,status,account_id,attempts,stream_broken,compensated,created_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,rate_input,rate_output,rate_cache_read,rate_cache_write,rate_ratio FROM usage_logs WHERE stream_broken=1 ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, nil, err

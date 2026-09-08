@@ -216,12 +216,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if tokens <= 0 {
 		tokens = int64(len(res.Text))
 	}
+	// Cost comes from the price list and the user's ratio, not from the raw
+	// token count. The rate snapshot is written onto the row so this bill can
+	// still be explained after the price list changes.
+	//
+	// No breakdown is passed yet: no adapter reports input/output/cache counts
+	// separately, and splitting a total by a guess would look precise while
+	// being invented. Total-only bills whole, which is correct and honest.
+	counts := model.TokenCounts{Total: tokens}
+	cost, billedAt := s.Store.PriceCall(owner.ID, req.Model, counts)
+
 	// The real cost is charged and the whole hold is released together. The
 	// estimate never becomes the bill: over-reserving refunds, under-reserving
 	// still charges what the call actually cost.
 	_ = s.Store.SettleUsage(model.UsageLog{
 		UserID: owner.ID, KeyID: key.ID, Model: req.Model,
-		AccountID: res.Account.ID, Tokens: tokens, Cost: tokens,
+		AccountID: res.Account.ID, Tokens: tokens,
+		TokenParts: counts, BilledAt: billedAt, Cost: cost,
 		Status: "success", Attempts: res.Attempts,
 	}, held)
 	settled = true
