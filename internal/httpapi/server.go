@@ -126,7 +126,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		req.Model = "gpt-4o-mini"
 	}
 
-	res, relayErr := s.Sched.Relay(req)
+	var res gateway.Result
+	var relayErr error
+	if req.Stream {
+		res, relayErr = s.Sched.RelayStream(req, w)
+	} else {
+		res, relayErr = s.Sched.Relay(req)
+	}
 	s.Store.TouchKey(key.ID, time.Now().UTC().Format("2006-01-02 15:04"))
 
 	if relayErr != nil {
@@ -185,7 +191,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if req.Stream {
-		gateway.WriteSSE(w, res.Text)
+		// Body already flushed through by RelayStream.
 		return
 	}
 	jsonOut(w, map[string]any{

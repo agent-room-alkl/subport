@@ -36,6 +36,7 @@ type Reply struct {
 type Provider interface {
 	Name() string
 	Call(a model.Account, req ChatRequest) (Reply, error)
+	Stream(a model.Account, req ChatRequest, w http.ResponseWriter) (tokens int64, err error)
 }
 
 var providers = map[string]Provider{
