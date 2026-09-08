@@ -1,11 +1,17 @@
-// Package store is file-backed persistence for Subport.
+// Package store is Subport's persistence layer, backed by SQLite.
 //
-// Deliberately stdlib-only: `go run ./cmd/subport` must work with no database
-// to install and no modules to download. This package is the seam - T-12
-// swaps it for SQLite and nothing in gateway/ or httpapi/ should change.
+// There is exactly one storage path. An earlier revision wrote both a JSON
+// snapshot and SQLite on every mutation; that left two sources of truth which
+// could drift apart silently, which is the failure mode a storage layer exists
+// to prevent. A legacy JSON file is now imported ONCE on first boot and never
+// written again.
+//
+// This package is the seam: gateway/ and httpapi/ know only the exported
+// method set below and were not edited when the backing store changed.
 package store
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -13,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -23,29 +28,9 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
-// seedAccounts is the starting pool for a fresh store. Two accounts share
-// tier 1 on purpose: that is what makes horizontal failover observable.
-//
-// base must be the address this process is actually reachable on, because the
-// demo upstream is served by this same process. Hardcoding a port here breaks
-// the gateway silently whenever the server runs anywhere else: every attempt
-// fails to connect and the caller gets 503 with nothing pointing at the cause.
-func seedAccounts(base string) []model.Account {
-	return []model.Account{
-		{ID: "acct-openai-1", Name: "OpenAI primary", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
-		{ID: "acct-openai-2", Name: "OpenAI sibling", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
-		{ID: "acct-anthropic-1", Name: "Anthropic backup", Provider: "anthropic", BaseURL: base, Priority: 2, Healthy: true},
-		// acct-stream-break simulates a mid-stream cut: the mock upstream
-		// sends a 200 + partial JSON then closes the connection. This is
-		// how stream_broken usage logs are produced end-to-end for the
-		// compensation proof. In a real deployment this account would not
-		// exist — a real upstream that cuts mid-stream produces the same
-		// code path through CallUpstream's truncated-body detection.
-		{ID: "acct-stream-break", Name: "Stream break test", Provider: "openai", BaseURL: base, Priority: 3, Healthy: true},
-	}
-}
-
-type data struct {
+// legacyData is the shape of the pre-SQLite JSON file. It exists only so an
+// existing deployment's data can be imported once; nothing writes it.
+type legacyData struct {
 	Users    []model.User     `json:"users"`
 	Keys     []model.APIKey   `json:"keys"`
 	Usage    []model.UsageLog `json:"usage"`
@@ -54,91 +39,93 @@ type data struct {
 }
 
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	d    data
-	db   *sql.DB
+	mu sync.Mutex // serialises multi-statement work; SQLite handles the rest
+	db *sql.DB
 }
 
+// seedAccounts is the starting pool for a fresh store. Two accounts share
+// tier 1 on purpose: that is what makes horizontal failover observable.
+//
+// base must be the address this process is actually reachable on, because the
+// demo upstream is served by this same process. Hardcoding a port here breaks
+// the gateway silently whenever the server runs anywhere else.
+func seedAccounts(base string) []model.Account {
+	return []model.Account{
+		{ID: "acct-openai-1", Name: "OpenAI primary", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
+		{ID: "acct-openai-2", Name: "OpenAI sibling", Provider: "openai", BaseURL: base, Priority: 1, Healthy: true},
+		{ID: "acct-anthropic-1", Name: "Anthropic backup", Provider: "anthropic", BaseURL: base, Priority: 2, Healthy: true},
+		{ID: "acct-stream-break", Name: "Stream-break demo", Provider: "openai", BaseURL: base, Priority: 3, Healthy: false},
+	}
+}
+
+// OpenStore opens the SQLite database beside path. If path names a legacy JSON
+// snapshot and the database is still empty, its contents are imported once.
 func OpenStore(path, seedBaseURL string) (*Store, error) {
-	// Keep the existing JSON snapshot as the migration source of truth while
-	// every store now boots the SQLite schema. CRUD migration follows in T-12B-E.
-	s := &Store{path: path}
 	db, err := openSQLite(path + ".sqlite")
 	if err != nil {
 		return nil, err
 	}
-	s.db = db
+	s := &Store{db: db}
+
+	if err := s.importLegacyJSON(path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.sqliteEnsureAccounts(seedAccounts(seedBaseURL)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// importLegacyJSON is one-way and runs at most once: it bails out the moment
+// the database already holds users, so the JSON file is never a live mirror.
+func (s *Store) importLegacyJSON(path string) error {
+	var users int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
+		return err
+	}
+	if users > 0 {
+		return nil // already migrated; leave the old file untouched
+	}
+
 	b, err := os.ReadFile(path)
-	if err == nil {
-		if err := json.Unmarshal(b, &s.d); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-		if err := s.sqliteEnsureAccounts(s.d.Accounts); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-		if err := s.sqliteEnsureKeys(s.d.Keys); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-		if err := s.sqliteEnsureUsage(s.d.Usage); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-		return s, nil
-	}
-	if !os.IsNotExist(err) {
-		_ = db.Close()
-		return nil, err
-	}
-	s.d = data{Accounts: seedAccounts(seedBaseURL)}
-	if err := s.sqliteEnsureAccounts(s.d.Accounts); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if err := s.sqliteEnsureKeys(s.d.Keys); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if err := s.sqliteEnsureUsage(s.d.Usage); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return s, s.flush()
-}
-
-// flush writes atomically: a crash mid-write must not leave a truncated file
-// that would lose every user on the next start.
-func (s *Store) flush() error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(s.d, "", "  ")
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // fresh install, nothing to import
+		}
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
-}
+	// Strip a UTF-8 BOM. Any Windows tool that has ever opened and saved the
+	// legacy file may have added one, and json.Unmarshal rejects it outright -
+	// which would otherwise refuse to start the whole service over a byte
+	// order mark, with an error nobody can act on.
+	b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
 
-func (s *Store) save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.flush()
+	var d legacyData
+	if err := json.Unmarshal(b, &d); err != nil {
+		return err
+	}
+	if err := s.sqliteImportUsers(d.Users); err != nil {
+		return err
+	}
+	if err := s.sqliteEnsureKeys(d.Keys); err != nil {
+		return err
+	}
+	if err := s.sqliteEnsureUsage(d.Usage); err != nil {
+		return err
+	}
+	if err := s.sqliteImportSessions(d.Sessions); err != nil {
+		return err
+	}
+	return s.sqliteEnsureAccounts(d.Accounts)
 }
 
 func (s *Store) Close() error {
 	if s.db == nil {
 		return nil
 	}
-	err := s.db.Close()
-	s.db = nil
-	return err
+	return s.db.Close()
 }
 
 // ---------------------------------------------------------------- ids, hashing
@@ -160,27 +147,31 @@ func HashWithSalt(secret, salt string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// ---------------------------------------------------------------- users
-
-// normUsername folds case and trims space. Usernames are compared on this
-// form so that "Admin" cannot be registered alongside "admin" - otherwise a
-// user could pick a name that reads as the operator's in any listing.
+// NormUsername folds case and trims space. Usernames are compared on this form
+// so that "Admin" cannot be registered alongside "admin" - otherwise a user
+// could pick a name that reads as the operator's in any listing.
 func NormUsername(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
+// ---------------------------------------------------------------- users
+
 func (s *Store) CreateUser(username, password, role string) (model.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	username = NormUsername(username)
 	if username == "" {
 		return model.User{}, errors.New("username is required")
 	}
-	for _, u := range s.d.Users {
-		if NormUsername(u.Username) == username {
-			return model.User{}, errors.New("username already taken")
-		}
+	taken, err := s.sqliteUsernameTaken(username)
+	if err != nil {
+		return model.User{}, err
 	}
+	if taken {
+		return model.User{}, errors.New("username already taken")
+	}
+
 	saltBytes := make([]byte, 8)
 	_, _ = rand.Read(saltBytes)
 	salt := hex.EncodeToString(saltBytes)
@@ -193,57 +184,34 @@ func (s *Store) CreateUser(username, password, role string) (model.User, error) 
 		QuotaTotal:   1_000_000,
 		CreatedAt:    time.Now().UTC(),
 	}
-	if s.db != nil {
-		if _, err := s.sqliteUserByName(username); err == nil {
-			return model.User{}, errors.New("username already taken")
-		}
-		if err := s.sqliteCreateUser(u); err != nil {
-			return model.User{}, err
-		}
-		return u, nil
+	if err := s.sqliteCreateUser(u); err != nil {
+		return model.User{}, err
 	}
-	s.d.Users = append(s.d.Users, u)
-	return u, s.flush()
+	return u, nil
 }
 
 func (s *Store) Authenticate(username, password string) (model.User, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	username = NormUsername(username)
-	if s.db != nil {
-		u, err := s.sqliteUserByName(username)
-		if err != nil || u.PasswordHash != HashWithSalt(password, u.Salt) {
-			return model.User{}, ErrNotFound
-		}
-		return u, nil
+	u, err := s.sqliteUserByName(NormUsername(username))
+	if err != nil {
+		return model.User{}, ErrNotFound
 	}
-	for _, u := range s.d.Users {
-		if NormUsername(u.Username) == username && u.PasswordHash == HashWithSalt(password, u.Salt) {
-			return u, nil
-		}
+	if u.PasswordHash != HashWithSalt(password, u.Salt) {
+		return model.User{}, ErrNotFound
 	}
-	return model.User{}, ErrNotFound
+	return u, nil
 }
 
 func (s *Store) UserByID(id string) (model.User, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.db != nil {
-		return s.sqliteUserByID(id)
+	u, err := s.sqliteUserByID(id)
+	if err != nil {
+		return model.User{}, ErrNotFound
 	}
-	for _, u := range s.d.Users {
-		if u.ID == id {
-			return u, nil
-		}
-	}
-	return model.User{}, ErrNotFound
+	return u, nil
 }
 
 // ---------------------------------------------------------------- sessions
 
 func (s *Store) NewSession(userID string) (model.Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	b := make([]byte, 24)
 	_, _ = rand.Read(b)
 	sess := model.Session{
@@ -251,56 +219,28 @@ func (s *Store) NewSession(userID string) (model.Session, error) {
 		UserID:    userID,
 		ExpiresAt: time.Now().UTC().Add(7 * 24 * time.Hour),
 	}
-	if s.db != nil {
-		return sess, s.sqliteNewSession(sess)
+	if err := s.sqliteNewSession(sess); err != nil {
+		return model.Session{}, err
 	}
-	s.d.Sessions = append(s.d.Sessions, sess)
-	return sess, s.flush()
+	return sess, nil
 }
 
 func (s *Store) SessionUser(token string) (model.User, error) {
-	s.mu.RLock()
-	if s.db != nil {
-		userID, expires, err := s.sqliteSessionUser(token)
-		s.mu.RUnlock()
-		if err != nil || time.Now().UTC().After(expires) {
-			return model.User{}, ErrNotFound
-		}
-		return s.UserByID(userID)
+	if token == "" {
+		return model.User{}, ErrNotFound
 	}
-	var userID string
-	for _, sess := range s.d.Sessions {
-		if sess.Token == token {
-			if time.Now().UTC().After(sess.ExpiresAt) {
-				s.mu.RUnlock()
-				return model.User{}, ErrNotFound
-			}
-			userID = sess.UserID
-			break
-		}
+	userID, expires, err := s.sqliteSessionUser(token)
+	if err != nil {
+		return model.User{}, ErrNotFound
 	}
-	s.mu.RUnlock()
-	if userID == "" {
+	if time.Now().UTC().After(expires) {
 		return model.User{}, ErrNotFound
 	}
 	return s.UserByID(userID)
 }
 
 func (s *Store) DropSession(token string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.db != nil {
-		_, err := s.db.Exec(`DELETE FROM sessions WHERE token=?`, token)
-		return err
-	}
-	out := s.d.Sessions[:0]
-	for _, sess := range s.d.Sessions {
-		if sess.Token != token {
-			out = append(out, sess)
-		}
-	}
-	s.d.Sessions = out
-	return s.flush()
+	return s.sqliteDropSession(token)
 }
 
 // ---------------------------------------------------------------- api keys
@@ -310,28 +250,18 @@ func (s *Store) DropSession(token string) error {
 // request, so a caller cannot ask for someone else's rows.
 
 func (s *Store) KeysOf(userID string) []model.APIKey {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.db != nil {
-		out, err := s.sqliteKeysOf(userID)
-		if err != nil {
-			return []model.APIKey{}
-		}
-		return out
+	keys, err := s.sqliteKeysOf(userID)
+	if err != nil || keys == nil {
+		return []model.APIKey{}
 	}
-	out := []model.APIKey{}
-	for _, k := range s.d.Keys {
-		if k.UserID == userID {
-			out = append(out, k)
-		}
-	}
-	return out
+	return keys
 }
 
 // CreateKey returns the plaintext secret exactly once; only its hash is stored.
 func (s *Store) CreateKey(userID, name string) (model.APIKey, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	secret := NewSecret()
 	k := model.APIKey{
 		ID:        NewID("key"),
@@ -343,256 +273,103 @@ func (s *Store) CreateKey(userID, name string) (model.APIKey, string, error) {
 		CreatedAt: time.Now().UTC(),
 		LastUsed:  "never",
 	}
-	if s.db != nil {
-		if err := s.sqliteInsertKey(k); err != nil {
-			return model.APIKey{}, "", err
-		}
-		return k, secret, nil
+	if err := s.sqliteInsertKey(k); err != nil {
+		return model.APIKey{}, "", err
 	}
-	s.d.Keys = append(s.d.Keys, k)
-	return k, secret, s.flush()
+	return k, secret, nil
 }
 
-// KeyBySecret resolves a presented API key to its record and owner.
-// This is the gateway's authentication path: without it, /v1/* would serve
-// anyone, usage could not be attributed, and quota could not be enforced.
-// Disabled keys are refused here rather than by the caller, so a revoked key
-// stops working everywhere at once.
+// KeyBySecret resolves a presented API key to its record and owner. This is the
+// gateway's authentication path. Disabled keys are refused here rather than by
+// the caller, so a revoked key stops working everywhere at once.
 func (s *Store) KeyBySecret(secret string) (model.APIKey, model.User, error) {
 	if secret == "" {
 		return model.APIKey{}, model.User{}, ErrNotFound
 	}
-	sum := HashWithSalt(secret, "")
-
-	s.mu.RLock()
-	var found model.APIKey
-	ok := false
-	if s.db != nil {
-		k, err := s.sqliteKeyBySecretHash(sum)
-		if err == nil {
-			found = k
-			ok = true
-		}
-	} else {
-		for _, k := range s.d.Keys {
-			if k.SecretSHA == sum {
-				found = k
-				ok = true
-				break
-			}
-		}
-	}
-	s.mu.RUnlock()
-
-	if !ok || !found.Enabled {
+	k, err := s.sqliteKeyBySecretHash(HashWithSalt(secret, ""))
+	if err != nil || !k.Enabled {
 		return model.APIKey{}, model.User{}, ErrNotFound
 	}
-	u, err := s.UserByID(found.UserID)
+	u, err := s.UserByID(k.UserID)
 	if err != nil {
 		return model.APIKey{}, model.User{}, ErrNotFound
 	}
-	return found, u, nil
+	return k, u, nil
 }
 
 // TouchKey records that a key was just used, for the "last used" column.
 func (s *Store) TouchKey(keyID, when string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.db != nil {
-		_ = s.sqliteTouchKey(keyID, when)
-		return
-	}
-	for i := range s.d.Keys {
-		if s.d.Keys[i].ID == keyID {
-			s.d.Keys[i].LastUsed = when
-			_ = s.flush()
-			return
-		}
-	}
+	_ = s.sqliteTouchKey(keyID, when)
 }
 
 // KeyByID is scoped: a key belonging to another user reads as not-found, so
 // guessing an id leaks nothing about whether it exists.
 func (s *Store) KeyByID(userID, keyID string) (model.APIKey, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.db != nil {
-		return s.sqliteKeyByID(userID, keyID)
+	k, err := s.sqliteKeyByID(userID, keyID)
+	if err != nil {
+		return model.APIKey{}, ErrNotFound
 	}
-	for _, k := range s.d.Keys {
-		if k.ID == keyID && k.UserID == userID {
-			return k, nil
-		}
-	}
-	return model.APIKey{}, ErrNotFound
+	return k, nil
 }
 
 func (s *Store) SetKeyEnabled(userID, keyID string, enabled bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.db != nil {
-		return s.sqliteSetKeyEnabled(userID, keyID, enabled)
-	}
-	for i := range s.d.Keys {
-		if s.d.Keys[i].ID == keyID && s.d.Keys[i].UserID == userID {
-			s.d.Keys[i].Enabled = enabled
-			return s.flush()
-		}
-	}
-	return ErrNotFound
+	return s.sqliteSetKeyEnabled(userID, keyID, enabled)
 }
 
 func (s *Store) DeleteKey(userID, keyID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.db != nil {
-		return s.sqliteDeleteKey(userID, keyID)
-	}
-	found := false
-	out := s.d.Keys[:0]
-	for _, k := range s.d.Keys {
-		if k.ID == keyID && k.UserID == userID {
-			found = true
-			continue
-		}
-		out = append(out, k)
-	}
-	if !found {
-		return ErrNotFound
-	}
-	s.d.Keys = out
-	return s.flush()
+	return s.sqliteDeleteKey(userID, keyID)
 }
 
 // ---------------------------------------------------------------- usage
 
 func (s *Store) UsageOf(userID string, limit int) []model.UsageLog {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.db != nil {
-		out, err := s.sqliteUsageOf(userID, limit)
-		if err != nil {
-			return []model.UsageLog{}
-		}
-		return out
+	logs, err := s.sqliteUsageOf(userID, limit)
+	if err != nil || logs == nil {
+		return []model.UsageLog{}
 	}
-	out := []model.UsageLog{}
-	for i := len(s.d.Usage) - 1; i >= 0 && len(out) < limit; i-- {
-		if s.d.Usage[i].UserID == userID {
-			out = append(out, s.d.Usage[i])
-		}
-	}
-	return out
+	return logs
 }
 
 func (s *Store) AddUsage(l model.UsageLog) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	l.ID = NewID("use")
 	l.CreatedAt = time.Now().UTC()
-	if s.db != nil {
-		return s.sqliteAddUsage(l)
-	}
-	s.d.Usage = append(s.d.Usage, l)
-	for i := range s.d.Users {
-		if s.d.Users[i].ID == l.UserID {
-			s.d.Users[i].QuotaUsed += l.Cost
-		}
-	}
-	return s.flush()
+	// The insert and the quota increment share one transaction, so a crash
+	// cannot bill a user for a call that was never recorded.
+	return s.sqliteAddUsage(l)
 }
 
 // ---------------------------------------------------------------- accounts
 
 func (s *Store) Accounts() []model.Account {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.db != nil {
-		if out, err := s.sqliteAccounts(); err == nil {
-			return out
-		}
+	accounts, err := s.sqliteAccounts()
+	if err != nil || accounts == nil {
+		return []model.Account{}
 	}
-	out := make([]model.Account, len(s.d.Accounts))
-	copy(out, s.d.Accounts)
-	return out
+	return accounts
 }
 
 func (s *Store) SetAccountHealthy(id string, healthy bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.db != nil {
-		return s.sqliteSetAccountHealthy(id, healthy)
-	}
-	for i := range s.d.Accounts {
-		if s.d.Accounts[i].ID == id {
-			s.d.Accounts[i].Healthy = healthy
-			return s.flush()
-		}
-	}
-	return ErrNotFound
+	return s.sqliteSetAccountHealthy(id, healthy)
 }
 
 // ---------------------------------------------------------------- compensation
 
-// CompensateBrokenStreams is the auto-compensation engine. It looks at a
-// user's recent calls (the last WindowSize), and if the stream_broken rate
-// crosses Threshold with at least MinBroken broken calls, it credits the
-// total cost of uncompensated broken calls back to the user's quota and
-// marks each one Compensated=true. Running it again on already-compensated
-// logs credits nothing — the compensated flag is the idempotency guard.
+// CompensateBrokenStreams credits back the cost of a user's uncompensated
+// broken streams once their broken rate crosses the configured threshold.
+// It is idempotent: a second run finds nothing uncompensated and credits zero.
 func (s *Store) CompensateBrokenStreams(userID string, cfg model.CompensationConfig) (model.CompensationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.db != nil {
-		recent, err := s.sqliteUsageOf(userID, cfg.WindowSize)
-		if err != nil {
-			return model.CompensationResult{}, err
-		}
-		result := model.CompensationResult{TotalCount: len(recent)}
-		for _, l := range recent {
-			if l.StreamBroken {
-				result.BrokenCount++
-			}
-		}
-		if result.TotalCount > 0 {
-			result.Rate = float64(result.BrokenCount) / float64(result.TotalCount)
-		}
-		if result.BrokenCount < cfg.MinBroken || result.Rate < cfg.Threshold {
-			return result, nil
-		}
-		var credit int64
-		var ids []string
-		for _, l := range recent {
-			if l.StreamBroken && !l.Compensated {
-				credit += l.Cost
-				ids = append(ids, l.ID)
-			}
-		}
-		if err := s.sqliteMarkUsageCompensated(ids); err != nil {
-			return model.CompensationResult{}, err
-		}
-		if err := s.sqliteCreditQuota(userID, credit); err != nil {
-			return model.CompensationResult{}, err
-		}
-		result.Triggered = true
-		result.Credited = credit
-		result.CompensatedCount = len(ids)
-		return result, nil
+	recent, err := s.sqliteUsageOf(userID, cfg.WindowSize)
+	if err != nil {
+		return model.CompensationResult{}, err
 	}
 
-	// Collect the user's recent calls, most-recent-first.
-	var recent []model.UsageLog
-	for i := len(s.d.Usage) - 1; i >= 0 && len(recent) < cfg.WindowSize; i-- {
-		if s.d.Usage[i].UserID == userID {
-			recent = append(recent, s.d.Usage[i])
-		}
-	}
-
-	result := model.CompensationResult{
-		TotalCount:  len(recent),
-		BrokenCount: 0,
-	}
+	result := model.CompensationResult{TotalCount: len(recent)}
 	for _, l := range recent {
 		if l.StreamBroken {
 			result.BrokenCount++
@@ -601,70 +378,43 @@ func (s *Store) CompensateBrokenStreams(userID string, cfg model.CompensationCon
 	if result.TotalCount > 0 {
 		result.Rate = float64(result.BrokenCount) / float64(result.TotalCount)
 	}
-
-	// Guard: not enough broken calls to trust the rate.
-	if result.BrokenCount < cfg.MinBroken {
-		return result, nil
-	}
-	// Guard: rate below threshold — don't compensate yet.
-	if result.Rate < cfg.Threshold {
+	// Two guards: too few broken calls to trust the rate, or a rate below the
+	// threshold. Either way, nothing is credited.
+	if result.BrokenCount < cfg.MinBroken || result.Rate < cfg.Threshold {
 		return result, nil
 	}
 
-	// Gather uncompensated broken logs and their total cost.
 	var credit int64
-	compensatedIDs := map[string]bool{}
+	var ids []string
 	for _, l := range recent {
 		if l.StreamBroken && !l.Compensated {
 			credit += l.Cost
-			compensatedIDs[l.ID] = true
+			ids = append(ids, l.ID)
 		}
 	}
-
-	// Set compensated=true on each broken log that was credited.
-	for i := range s.d.Usage {
-		if compensatedIDs[s.d.Usage[i].ID] {
-			s.d.Usage[i].Compensated = true
-		}
+	if err := s.sqliteMarkUsageCompensated(ids); err != nil {
+		return model.CompensationResult{}, err
 	}
-
-	// Credit the user's quota_used back.
-	for i := range s.d.Users {
-		if s.d.Users[i].ID == userID {
-			s.d.Users[i].QuotaUsed -= credit
-			if s.d.Users[i].QuotaUsed < 0 {
-				s.d.Users[i].QuotaUsed = 0
-			}
-		}
+	if err := s.sqliteCreditQuota(userID, credit); err != nil {
+		return model.CompensationResult{}, err
 	}
 
 	result.Triggered = true
 	result.Credited = credit
-	result.CompensatedCount = len(compensatedIDs)
-	return result, s.flush()
+	result.CompensatedCount = len(ids)
+	return result, nil
 }
 
-// Compensations returns all stream_broken usage logs, for the admin view.
-// Pending = not yet compensated; Completed = compensated.
 func (s *Store) Compensations() (pending, completed []model.UsageLog) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.db != nil {
-		p, c, err := s.sqliteCompensations()
-		if err != nil {
-			return nil, nil
-		}
-		return p, c
+	p, c, err := s.sqliteCompensations()
+	if err != nil {
+		return []model.UsageLog{}, []model.UsageLog{}
 	}
-	for _, l := range s.d.Usage {
-		if !l.StreamBroken {
-			continue
-		}
-		if l.Compensated {
-			completed = append(completed, l)
-		} else {
-			pending = append(pending, l)
-		}
+	if p == nil {
+		p = []model.UsageLog{}
 	}
-	return pending, completed
+	if c == nil {
+		c = []model.UsageLog{}
+	}
+	return p, c
 }

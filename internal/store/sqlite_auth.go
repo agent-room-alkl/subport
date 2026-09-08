@@ -45,3 +45,36 @@ func (s *Store) sqliteSessionUser(token string) (string, time.Time, error) {
 	exp, err := time.Parse(time.RFC3339Nano, expires)
 	return userID, exp, err
 }
+
+func (s *Store) sqliteDropSession(token string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE token=?`, token)
+	return err
+}
+
+// sqliteUsernameTaken compares on the normalised form so "Admin" cannot be
+// registered alongside "admin".
+func (s *Store) sqliteUsernameTaken(norm string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE username=?`, norm).Scan(&n)
+	return n > 0, err
+}
+
+// sqliteImportUsers is part of the one-way JSON import; it is a no-op once the
+// users table has anything in it.
+func (s *Store) sqliteImportUsers(users []model.User) error {
+	for _, u := range users {
+		if err := s.sqliteCreateUser(u); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) sqliteImportSessions(sessions []model.Session) error {
+	for _, sess := range sessions {
+		if err := s.sqliteNewSession(sess); err != nil {
+			return err
+		}
+	}
+	return nil
+}
