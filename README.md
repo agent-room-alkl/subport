@@ -2,7 +2,7 @@
 
 Agent 账号转 API 的网关。目标是**稳定** —— 不要总是断。
 
-> 当前状态：**第一版开发中**。前端已可运行（`web/`），后端尚未提交。
+> 当前状态：**第一版开发中**。网关内核、账号故障转移、用户体系都已可运行；上游仍是模拟的，用户端 `/console` 在做。详见文末「已知边界」。
 
 ## 这个项目是怎么来的
 
@@ -34,8 +34,10 @@ new-api 原生的重试是「逐档下降」—— 第 N 次重试直接取第 N
 ## 目录
 
 ```
-web/     前端控制台 —— 零依赖、零构建步骤，详见 web/README.md
-backend/ Go 网关内核 —— 调度器 + failover，单文件
+web/               前端控制台 —— 零依赖、零构建步骤，详见 web/README.md
+backend/main.go    路由、调度器、failover、relay
+backend/store.go   持久化：user / api_key / usage_log / session / account
+backend/auth.go    注册登录、角色、用户维度隔离的 console 接口
 ```
 
 ## 跑起来
