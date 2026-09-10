@@ -3,7 +3,10 @@
 // possible between the layers that use it.
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type User struct {
 	ID           string `json:"id"`
@@ -81,6 +84,8 @@ type Account struct {
 	LastError           string  `json:"last_error"`
 	ConsecutiveTimeouts int     `json:"consecutive_timeouts"`
 	Consecutive403      int     `json:"consecutive_403"`
+	Consecutive429      int     `json:"consecutive_429"`
+	ProxyID             string  `json:"proxy_id"`
 }
 
 // CompensationConfig controls the auto-compensation engine. A stream cut is
@@ -106,9 +111,12 @@ type CompensationResult struct {
 
 // PublicUser strips the password hash and salt. Never serialise User directly.
 func PublicUser(u User) map[string]any {
+	remaining := u.QuotaTotal - u.QuotaUsed
 	return map[string]any{
 		"id": u.ID, "username": u.Username, "role": u.Role,
 		"quota_total": u.QuotaTotal, "quota_used": u.QuotaUsed,
+		"quota_reserved": u.QuotaReserved,
+		"remaining": remaining,
 		"created_at": u.CreatedAt,
 	}
 }
@@ -122,11 +130,16 @@ func PublicKey(k APIKey) map[string]any {
 }
 
 // PublicAccount is the admin view, shaped to the front-end contract in
-// web/admin/README.md.
-func PublicAccount(a Account) map[string]any {
+// web/admin/README.md. cred supplies presence flags only — token values are
+// never copied into the returned map.
+func PublicAccount(a Account, cred AccountCredential) map[string]any {
 	state := "healthy"
 	if !a.Healthy {
 		state = "paused"
+	}
+	var expires any
+	if strings.TrimSpace(cred.ExpiresAt) != "" {
+		expires = cred.ExpiresAt
 	}
 	return map[string]any{
 		"id": a.ID, "label": a.Name, "provider": a.Provider,
@@ -134,5 +147,12 @@ func PublicAccount(a Account) map[string]any {
 		"cooldown_until": a.CooldownUntil, "last_error": a.LastError,
 		"consecutive_timeouts": a.ConsecutiveTimeouts,
 		"consecutive_403":      a.Consecutive403,
+		"consecutive_429":      a.Consecutive429,
+		"proxy_id":            a.ProxyID,
+		"has_access_token":    strings.TrimSpace(cred.AccessToken) != "",
+		"has_refresh_token":   strings.TrimSpace(cred.RefreshToken) != "",
+		"expires_at":          expires,
 	}
 }
+
+

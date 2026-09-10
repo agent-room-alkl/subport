@@ -24,7 +24,7 @@ func StreamUpstream(a model.Account, req ChatRequest, w http.ResponseWriter) (in
 func (s *Scheduler) RelayStream(req ChatRequest, w http.ResponseWriter) (Result, error) {
 	var lastErr error
 	for attempt := 0; attempt < MaxAttempts; attempt++ {
-		acct, ok := s.Pick(attempt)
+		acct, ok := s.Pick(attempt, req.Model)
 		if !ok {
 			continue
 		}
@@ -34,6 +34,7 @@ func (s *Scheduler) RelayStream(req ChatRequest, w http.ResponseWriter) (Result,
 			status = "failed"
 		}
 		log.Printf("stream attempt=%d account=%s provider=%s -> %s", attempt, acct.ID, acct.Provider, status)
+		s.NoteUpstreamResult(acct.ID, err)
 		if err == nil {
 			return Result{Account: acct, Tokens: tokens, Attempts: attempt + 1}, nil
 		}
@@ -145,7 +146,7 @@ func (openAIProvider) Stream(a model.Account, req ChatRequest, w http.ResponseWr
 	if key != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+key)
 	}
-	resp, err := upstreamClient.Do(httpReq)
+	resp, err := HTTPClientFor(a).Do(httpReq)
 	if err != nil {
 		return 0, RelayError{Err: err, FirstByteSent: false}
 	}

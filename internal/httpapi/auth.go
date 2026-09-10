@@ -139,6 +139,10 @@ func (s *Server) consoleRoutes(w http.ResponseWriter, r *http.Request, rest stri
 		return
 	}
 
+	if s.consoleRechargeRoutes(w, r, rest, me) {
+		return
+	}
+
 	switch {
 	case rest == "me" && r.Method == http.MethodGet:
 		jsonOut(w, model.PublicUser(me.User))

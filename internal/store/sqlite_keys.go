@@ -219,3 +219,52 @@ func (s *Store) sqliteCompensations() (pending, completed []model.UsageLog, err 
 }
 
 var _ interface{ Scan(...any) error } = (*sql.Row)(nil)
+
+func (s *Store) sqliteListAllKeys() ([]model.APIKey, error) {
+	rows, err := s.db.Query(
+		`SELECT id,user_id,name,prefix,secret_hash,enabled,created_at,last_used_at FROM api_keys ORDER BY created_at`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.APIKey{}
+	for rows.Next() {
+		k, err := scanSQLiteKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) sqliteUsageRecent(limit int) ([]model.UsageLog, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(
+		`SELECT id,user_id,key_id,model,tokens,cost,status,account_id,attempts,stream_broken,compensated,created_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,rate_input,rate_output,rate_cache_read,rate_cache_write,rate_ratio FROM usage_logs ORDER BY created_at DESC LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.UsageLog{}
+	for rows.Next() {
+		l, err := scanSQLiteUsage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) sqliteCountUsageSince(sinceRFC3339 string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM usage_logs WHERE created_at >= ?`, sinceRFC3339).Scan(&n)
+	return n, err
+}
+

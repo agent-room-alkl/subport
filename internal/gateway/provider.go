@@ -193,7 +193,7 @@ func (openAIProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 		httpReq.Header.Set("Authorization", "Bearer "+key)
 	}
 
-	resp, err := upstreamClient.Do(httpReq)
+	resp, err := HTTPClientFor(a).Do(httpReq)
 	if err != nil {
 		// No response at all: safe to try the next account.
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}

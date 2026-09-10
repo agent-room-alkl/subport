@@ -253,3 +253,11 @@ Anthropic 的 `/v1/messages` + `x-api-key` 形状不同，还没写适配器；�
 - **密码哈希是 SHA-256 加盐，不是 bcrypt/argon2。** 标准库能做到的上限。上线前应换成 argon2id。
 - **前端只读。** 新建/编辑按钮都禁用，等接口定稿。用户端 `/console` 还在做。
 - 计费结算、发卡兑换还没开始。断流补偿已实现（见上方「断流补偿」）。
+
+## Claude.ai subscription
+
+To bind your own Claude.ai / Claude Code OAuth subscription for real (non-mock) completions, see [docs/CLAUDE_SUBSCRIPTION.md](docs/CLAUDE_SUBSCRIPTION.md).
+
+## ChatGPT / Codex subscription
+
+To bind your own ChatGPT / Codex CLI OAuth subscription for real (non-mock) completions, see [docs/CODEX_SUBSCRIPTION.md](docs/CODEX_SUBSCRIPTION.md).

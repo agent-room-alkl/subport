@@ -1,18 +1,3 @@
-// Package gateway holds the part of Subport that the whole project exists for:
-// choosing an upstream account, and deciding what to do when one fails.
-//
-// Two rules govern everything here:
-//
-//  1. Horizontal first. When an account fails, the next account IN THE SAME
-//     PRIORITY TIER takes over. Only when a tier is exhausted does the request
-//     descend. This is the correction to new-api's getPriority, which selects
-//     priorities[retry] and so drops a tier on every single retry - meaning a
-//     pool of ten healthy peers in one tier would never be tried.
-//
-//  2. The first byte is the point of no return. A failure BEFORE the first
-//     byte reaches the client may be retried on another account. A failure
-//     AFTER it must not be replayed: emitted tokens cannot be recalled, and a
-//     replay shows the caller duplicated output, which is worse than the cut.
 package gateway
 
 import (
@@ -49,12 +34,31 @@ func (e RelayError) Error() string { return e.Err.Error() }
 func (e RelayError) Unwrap() error { return e.Err }
 
 type Scheduler struct {
-	mu       sync.RWMutex
-	accounts []model.Account
+	mu          sync.RWMutex
+	accounts    []model.Account
+	routes      []model.ModelRoute
+	healthStore AccountHealthStore
 }
 
 func NewScheduler(accounts []model.Account) *Scheduler {
 	return &Scheduler{accounts: accounts}
+}
+
+// SetModelRoutes replaces the scheduler's routing table used by Pick.
+func (s *Scheduler) SetModelRoutes(routes []model.ModelRoute) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.ModelRoute, len(routes))
+	copy(out, routes)
+	s.routes = out
+}
+
+func (s *Scheduler) ModelRoutes() []model.ModelRoute {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]model.ModelRoute, len(s.routes))
+	copy(out, s.routes)
+	return out
 }
 
 func (s *Scheduler) Accounts() []model.Account {
@@ -63,6 +67,15 @@ func (s *Scheduler) Accounts() []model.Account {
 	out := make([]model.Account, len(s.accounts))
 	copy(out, s.accounts)
 	return out
+}
+
+// ReplaceAccounts swaps the in-memory account list (e.g. after store reload).
+func (s *Scheduler) ReplaceAccounts(accounts []model.Account) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Account, len(accounts))
+	copy(out, accounts)
+	s.accounts = out
 }
 
 // SetAccountHealth updates an account's Healthy flag in the scheduler's
@@ -74,6 +87,9 @@ func (s *Scheduler) SetAccountHealth(id string, healthy bool) {
 	for i := range s.accounts {
 		if s.accounts[i].ID == id {
 			s.accounts[i].Healthy = healthy
+			if healthy {
+				s.accounts[i].CooldownUntil = ""
+			}
 			return
 		}
 	}
@@ -82,14 +98,32 @@ func (s *Scheduler) SetAccountHealth(id string, healthy bool) {
 // Pick returns the account for the given attempt index. Attempts walk healthy
 // accounts tier by tier, exhausting each tier horizontally before descending -
 // attempt 0 and 1 are peers in tier 1 before attempt 2 reaches tier 2.
-func (s *Scheduler) Pick(attempt int) (model.Account, bool) {
+//
+// When modelName matches enabled model_routes, only eligible providers (plus
+// mock) are considered so the walk never burns attempts on the wrong upstream.
+func (s *Scheduler) Pick(attempt int, modelName string) (model.Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	now := time.Now().UTC()
 	tiers := map[int][]model.Account{}
 	for _, a := range s.accounts {
-		if a.Healthy {
-			tiers[a.Priority] = append(tiers[a.Priority], a)
+		if !accountSchedulable(a, now) {
+			continue
+		}
+		if !AccountEligibleForModel(s.routes, a.Provider, modelName) {
+			continue
+		}
+		tiers[a.Priority] = append(tiers[a.Priority], a)
+	}
+	// If routing filtered everyone out (e.g. only mock paused and no matching
+	// provider), fall back to unfiltered schedulable accounts so the pool is not
+	// silently empty.
+	if len(tiers) == 0 {
+		for _, a := range s.accounts {
+			if accountSchedulable(a, now) {
+				tiers[a.Priority] = append(tiers[a.Priority], a)
+			}
 		}
 	}
 	priorities := make([]int, 0, len(tiers))
@@ -110,19 +144,12 @@ func (s *Scheduler) Pick(attempt int) (model.Account, bool) {
 	return model.Account{}, false
 }
 
-// CallUpstream performs the real request against the account's BaseURL.
-// Swapping the demo /mock/upstream path for a provider endpoint is the only
-// change needed to talk to a real model.
 // CallUpstream dispatches to the adapter named by the account's Provider.
 // It fails closed on an unknown provider rather than falling back to the demo
 // upstream, so a misconfigured account is loud instead of silently fake.
 func CallUpstream(a model.Account, req ChatRequest) (Reply, error) {
 	p, err := ProviderFor(a.Provider)
 	if err != nil {
-		// A configuration fault, not an upstream fault. Retrying the same
-		// misconfigured account on the next attempt would not help, but the
-		// scheduler may still have healthy accounts on other providers, so
-		// this stays pre-first-byte and lets the walk continue.
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
 	return p.Call(a, req)
@@ -145,9 +172,9 @@ func (s *Scheduler) Relay(req ChatRequest) (Result, error) {
 	var lastErr error
 
 	for attempt := 0; attempt < MaxAttempts; attempt++ {
-		acct, ok := s.Pick(attempt)
+		acct, ok := s.Pick(attempt, req.Model)
 		if !ok {
-			continue // no account at this index; the pool may be smaller
+			continue
 		}
 
 		reply, err := CallUpstream(acct, req)
@@ -155,7 +182,13 @@ func (s *Scheduler) Relay(req ChatRequest) (Result, error) {
 		if err != nil {
 			status = "failed"
 		}
-		log.Printf("attempt=%d account=%s provider=%s -> %s", attempt, acct.ID, acct.Provider, status)
+		if err != nil {
+			log.Printf("attempt=%d account=%s provider=%s -> %s err=%v", attempt, acct.ID, acct.Provider, status, err)
+		} else {
+			log.Printf("attempt=%d account=%s provider=%s -> %s", attempt, acct.ID, acct.Provider, status)
+		}
+
+		s.NoteUpstreamResult(acct.ID, err)
 
 		if err == nil {
 			return Result{
@@ -169,14 +202,10 @@ func (s *Scheduler) Relay(req ChatRequest) (Result, error) {
 
 		var relayErr RelayError
 		if errors.As(err, &relayErr) && relayErr.FirstByteSent {
-			// Output already reached the client. Stop; do not replay.
 			return Result{Account: acct, Attempts: attempt + 1}, err
 		}
 	}
 
-	// Exhausted without a success. Note this is driven by an explicit failure
-	// to succeed, not by whether lastErr happens to be non-nil: a pool with no
-	// schedulable account at all must still be an error, not an empty 200.
 	if lastErr == nil {
 		lastErr = errors.New("no healthy account")
 	}

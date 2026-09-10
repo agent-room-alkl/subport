@@ -15,8 +15,42 @@ CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NU
 CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL, base_url TEXT NOT NULL, priority INTEGER NOT NULL, healthy INTEGER NOT NULL, load REAL NOT NULL, cooldown_until TEXT NOT NULL, last_error TEXT NOT NULL, consecutive_timeouts INTEGER NOT NULL, consecutive_403 INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS model_prices (model TEXT PRIMARY KEY, rate_input INTEGER NOT NULL, rate_output INTEGER NOT NULL, rate_cache_read INTEGER NOT NULL, rate_cache_write INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS billing_groups (name TEXT PRIMARY KEY, ratio INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS account_credentials (account_id TEXT PRIMARY KEY, access_token TEXT NOT NULL DEFAULT '', refresh_token TEXT NOT NULL DEFAULT '', extra_json TEXT NOT NULL DEFAULT '', expires_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS proxies (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'http', url TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT 'default', priority INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1, models_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS channel_accounts (channel_id TEXT NOT NULL, account_id TEXT NOT NULL, model_pattern TEXT NOT NULL DEFAULT '', priority INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(channel_id, account_id));
+CREATE TABLE IF NOT EXISTS model_routes (id TEXT PRIMARY KEY, pattern TEXT NOT NULL, provider TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1);
 CREATE INDEX IF NOT EXISTS idx_keys_user ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_logs(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_model_routes_priority ON model_routes(priority, provider);
+CREATE TABLE IF NOT EXISTS payment_orders (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  package_id TEXT NOT NULL DEFAULT '',
+  amount_fiat_cents INTEGER NOT NULL,
+  currency TEXT NOT NULL,
+  quota_credit INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  provider_trade_no TEXT NOT NULL DEFAULT '',
+  pay_url TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  paid_at TEXT NOT NULL DEFAULT '',
+  expires_at TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_orders_idem ON payment_orders(user_id, idempotency_key) WHERE idempotency_key != '';
+CREATE TABLE IF NOT EXISTS quota_topups (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  order_id TEXT NOT NULL DEFAULT '',
+  credit INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  operator_id TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_topups_order ON quota_topups(order_id) WHERE order_id != '';
 `
 
 func openSQLite(path string) (*sql.DB, error) {
@@ -49,6 +83,15 @@ func openSQLite(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err = softAddColumn(db, `ALTER TABLE accounts ADD COLUMN proxy_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	if err = softAddColumn(db, `ALTER TABLE accounts ADD COLUMN consecutive_429 INTEGER NOT NULL DEFAULT 0`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	// Token classes and the rate SNAPSHOT each row was billed at. The snapshot
 	// is the point: a bill is a statement about the past, so editing the price
@@ -70,6 +113,11 @@ func openSQLite(path string) (*sql.DB, error) {
 			_ = db.Close()
 			return nil, err
 		}
+	}
+
+	if err = seedDefaultModelRoutes(db); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 
 	// Reservations are in-flight state, and nothing is in flight while this
@@ -95,6 +143,36 @@ func openSQLite(path string) (*sql.DB, error) {
 func softAddColumn(db *sql.DB, stmt string) error {
 	if _, err := db.Exec(stmt); err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+	return nil
+}
+
+// seedDefaultModelRoutes inserts the built-in claude/codex/antigravity patterns when the
+// table is empty so a fresh install routes models before the wrong provider
+// is tried.
+func seedDefaultModelRoutes(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM model_routes`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	defaults := []struct {
+		id, pattern, provider string
+		priority              int
+	}{
+		{"route-claude", "^claude", "claude", 1},
+		{"route-codex", "^gpt-|^o[0-9]|^codex", "codex", 1},
+		{"route-antigravity", "^gemini|^tab_flash|^gpt-oss", "antigravity", 1},
+	}
+	for _, d := range defaults {
+		if _, err := db.Exec(
+			`INSERT INTO model_routes(id, pattern, provider, priority, enabled) VALUES(?,?,?,?,1)`,
+			d.id, d.pattern, d.provider, d.priority,
+		); err != nil {
 			return err
 		}
 	}

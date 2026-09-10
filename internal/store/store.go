@@ -263,6 +263,16 @@ func (s *Store) KeysOf(userID string) []model.APIKey {
 	return keys
 }
 
+// ListAllKeys returns every API key for admin listing. Callers must omit
+// SecretSHA from any response.
+func (s *Store) ListAllKeys() []model.APIKey {
+	keys, err := s.sqliteListAllKeys()
+	if err != nil || keys == nil {
+		return []model.APIKey{}
+	}
+	return keys
+}
+
 // CreateKey returns the plaintext secret exactly once; only its hash is stored.
 func (s *Store) CreateKey(userID, name string) (model.APIKey, string, error) {
 	s.mu.Lock()
@@ -334,6 +344,24 @@ func (s *Store) UsageOf(userID string, limit int) []model.UsageLog {
 		return []model.UsageLog{}
 	}
 	return logs
+}
+
+// UsageRecent returns the newest usage_logs across all users (admin view).
+func (s *Store) UsageRecent(limit int) []model.UsageLog {
+	logs, err := s.sqliteUsageRecent(limit)
+	if err != nil || logs == nil {
+		return []model.UsageLog{}
+	}
+	return logs
+}
+
+// CountUsageSince counts usage_logs with created_at >= since (RFC3339 / Nano).
+func (s *Store) CountUsageSince(sinceRFC3339 string) int {
+	n, err := s.sqliteCountUsageSince(sinceRFC3339)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // ReserveQuota admits a request by holding `amount` of the user's quota before
@@ -409,6 +437,15 @@ func (s *Store) Accounts() []model.Account {
 
 func (s *Store) SetAccountHealthy(id string, healthy bool) error {
 	return s.sqliteSetAccountHealthy(id, healthy)
+}
+
+// UpsertAccount inserts or updates one upstream account row. Credentials are
+// never part of the row - only where to call (provider/base_url) and scheduling
+// fields. Used by Claude subscription env bootstrap.
+func (s *Store) UpsertAccount(a model.Account) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sqliteUpsertAccount(a)
 }
 
 // ---------------------------------------------------------------- compensation
