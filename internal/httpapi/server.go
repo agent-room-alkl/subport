@@ -1,4 +1,4 @@
-// Package httpapi wires the routes and enforces the access boundary.
+﻿// Package httpapi wires the routes and enforces the access boundary.
 //
 // The boundary in one sentence: a /api/console/* handler NEVER reads a user id
 // from the request, only from the authenticated session. "Read someone else's
@@ -9,6 +9,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,7 +27,10 @@ type Server struct {
 }
 
 func New(st *store.Store, sched *gateway.Scheduler, inviteCode, webDir string, compCfg model.CompensationConfig) *Server {
-	return &Server{Store: st, Sched: sched, InviteCode: inviteCode, WebDir: webDir, CompCfg: compCfg}
+	s := &Server{Store: st, Sched: sched, InviteCode: inviteCode, WebDir: webDir, CompCfg: compCfg}
+	s.wireAntigravityOAuthPersist()
+	gateway.EnsureAntigravityCallbackListener()
+	return s
 }
 
 func jsonOut(w http.ResponseWriter, v any) {
@@ -43,7 +47,7 @@ func fail(w http.ResponseWriter, code int, msg string) {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -65,7 +69,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Simulate a mid-stream cut: send a 200 + partial JSON, then
 			// return. CallUpstream will see a 200 status but the JSON
 			// decode will fail (incomplete body), and return RelayError
-			// with FirstByteSent=true — the stream-broken code path.
+			// with FirstByteSent=true Ã¢â‚¬â€ the stream-broken code path.
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"content":"partial`))
 			return
@@ -77,12 +81,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == "/v1/chat/completions" && r.Method == http.MethodPost:
 		s.handleChat(w, r)
 
+	case p == "/v1/responses" && r.Method == http.MethodPost:
+		s.handleResponses(w, r)
+
+	case p == "/v1/messages" && r.Method == http.MethodPost:
+		s.handleMessages(w, r)
+
 	case p == "/api/auth/register" && r.Method == http.MethodPost:
 		s.handleRegister(w, r)
 	case p == "/api/auth/login" && r.Method == http.MethodPost:
 		s.handleLogin(w, r)
 	case p == "/api/auth/logout" && r.Method == http.MethodPost:
 		s.handleLogout(w, r)
+
+	// Public Alipay notify/return — must not require admin session.
+	case strings.HasPrefix(p, "/api/payments/"):
+		s.paymentRoutes(w, r, strings.TrimPrefix(p, "/api/payments/"))
 
 	// The signed-in user's own data, scoped by session.
 	case strings.HasPrefix(p, "/api/console/"):
@@ -97,7 +111,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		if s.WebDir != "" {
-			http.FileServer(http.Dir(s.WebDir)).ServeHTTP(w, r)
+			spaFileServer(s.WebDir).ServeHTTP(w, r)
 			return
 		}
 		http.NotFound(w, r)
@@ -261,12 +275,22 @@ func asRelay(err error, target *gateway.RelayError) bool {
 }
 
 func (s *Server) adminRoutes(w http.ResponseWriter, r *http.Request, rest string) {
+	if s.adminRechargeRoutes(w, r, rest) {
+		return
+	}
 	switch {
 	// --- accounts ---
 	case rest == "accounts" && r.Method == http.MethodGet:
+		creds, _ := s.Store.ListCredentialsForBootstrap()
+		byID := make(map[string]model.AccountCredential, len(creds))
+		for _, c := range creds {
+			byID[c.AccountID] = c
+		}
 		out := []map[string]any{}
 		for _, a := range s.Sched.Accounts() {
-			out = append(out, model.PublicAccount(a))
+			pub := model.PublicAccount(a, byID[a.ID])
+			applyRuntimeCredentialPresence(pub, a)
+			out = append(out, pub)
 		}
 		jsonOut(w, out)
 
@@ -332,12 +356,61 @@ func (s *Server) adminRoutes(w http.ResponseWriter, r *http.Request, rest string
 		jsonOut(w, result)
 
 	case rest == "channels" && r.Method == http.MethodGet:
-		jsonOut(w, []map[string]any{
-			{"id": "openai-main", "provider": "openai", "priority": 1, "status": "healthy"},
-			{"id": "anthropic-backup", "provider": "anthropic", "priority": 2, "status": "healthy"},
+		s.adminListChannels(w, r)
+
+	case rest == "overview" && r.Method == http.MethodGet:
+		accounts := s.Store.Accounts()
+		healthy := 0
+		for _, a := range accounts {
+			if a.Healthy {
+				healthy++
+			}
+		}
+		since := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+		jsonOut(w, map[string]any{
+			"accounts_total":   len(accounts),
+			"accounts_healthy": healthy,
+			"channels_total":   len(s.Store.ListChannels()),
+			"proxies_total":    len(s.Store.ListProxies()),
+			"keys_total":       len(s.Store.ListAllKeys()),
+			"requests_24h":     s.Store.CountUsageSince(since),
 		})
 
+	case rest == "keys" && r.Method == http.MethodGet:
+		out := []map[string]any{}
+		for _, k := range s.Store.ListAllKeys() {
+			out = append(out, map[string]any{
+				"id": k.ID, "name": k.Name, "prefix": k.Prefix,
+				"enabled": k.Enabled, "created_at": k.CreatedAt,
+				"last_used_at": k.LastUsed, "user_id": k.UserID,
+			})
+		}
+		jsonOut(w, out)
+
+	case rest == "usage" && r.Method == http.MethodGet:
+		limit := 100
+		if q := r.URL.Query().Get("limit"); q != "" {
+			if n, err := strconv.Atoi(q); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		logs := s.Store.UsageRecent(limit)
+		out := make([]map[string]any, 0, len(logs))
+		for _, l := range logs {
+			out = append(out, map[string]any{
+				"id": l.ID, "user_id": l.UserID, "key_id": l.KeyID,
+				"model": l.Model, "tokens": l.Tokens, "cost": l.Cost,
+				"status": l.Status, "account_id": l.AccountID,
+				"attempts": l.Attempts, "stream_broken": l.StreamBroken,
+				"compensated": l.Compensated, "created_at": l.CreatedAt,
+			})
+		}
+		jsonOut(w, out)
+
 	default:
+		if s.adminExtRoutes(w, r, rest) {
+			return
+		}
 		fail(w, http.StatusNotFound, "no such admin endpoint")
 	}
 }

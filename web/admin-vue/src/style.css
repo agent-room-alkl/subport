@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  font-family: Inter, system-ui, sans-serif;
+  background: #F4F7F9;
+  color: #0B1220;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #F4F7F9;
+}
+
+@layer base {
+  *:focus-visible {
+    @apply outline-none ring-2 ring-teal-bright/70 ring-offset-2 ring-offset-white;
+  }
+
+  ::selection {
+    @apply bg-teal-bright/30 text-ink;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-teal text-white shadow-sm hover:bg-teal-dim;
+  }
+  .btn-ghost {
+    @apply btn border border-line bg-white text-slatex shadow-sm hover:border-teal/50 hover:bg-teal-bright/5 hover:text-teal;
+  }
+  .btn-danger {
+    @apply btn border border-red-200 bg-white text-red-700 hover:border-red-300 hover:bg-red-50;
+  }
+  .header-action {
+    @apply btn border border-white/20 bg-white/10 text-white shadow-none hover:border-teal-bright/60 hover:bg-white/15 hover:text-teal-bright;
+  }
+  .sidebar-action {
+    @apply btn border border-white/15 bg-white/5 text-slate-300 shadow-none hover:border-teal-bright/50 hover:bg-white/10 hover:text-teal-bright;
+  }
+
+  .card {
+    @apply rounded-lg border border-line bg-white p-4 shadow-card;
+  }
+  .card-glow {
+    @apply card border-teal-bright/50 shadow-glow;
+  }
+
+  .input {
+    @apply w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-ink outline-none transition placeholder:text-slate-400 focus:border-teal focus:ring-2 focus:ring-teal-bright/30;
+  }
+  .input:disabled {
+    @apply cursor-not-allowed bg-slate-100 text-slatex;
+  }
+  .label {
+    @apply mb-1 block text-xs font-medium uppercase tracking-wide text-slatex;
+  }
+
+  .pill {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold;
+  }
+  .pill-ok {
+    @apply pill bg-emerald-50 text-teal ring-1 ring-inset ring-emerald-200;
+  }
+  .pill-warn {
+    @apply pill bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200;
+  }
+  .pill-err {
+    @apply pill bg-red-50 text-red-700 ring-1 ring-inset ring-red-200;
+  }
+  .pill-muted {
+    @apply pill bg-slate-100 text-slatex ring-1 ring-inset ring-slate-200;
+  }
+  .pill-info {
+    @apply pill bg-sky-50 text-sky-700 ring-1 ring-inset ring-sky-200;
+  }
+
+  .table-wrap {
+    @apply overflow-x-auto rounded-lg border border-line bg-white shadow-card;
+  }
+  .data-table {
+    @apply w-full min-w-[32rem] border-collapse text-left text-sm text-ink;
+  }
+  .data-table thead {
+    @apply bg-slate-50 text-xs uppercase tracking-wide text-slatex;
+  }
+  .data-table th {
+    @apply px-3 py-2.5 font-semibold;
+  }
+  .data-table td {
+    @apply border-t border-line px-3 py-2.5;
+  }
+  .data-table tbody tr {
+    @apply transition hover:bg-slate-50/80;
+  }
+
+  .modal-backdrop {
+    @apply fixed inset-0 z-40 flex items-center justify-center bg-navy/45 p-4 backdrop-blur-sm;
+  }
+  .modal-panel {
+    @apply card z-50 w-full max-w-lg space-y-4 p-5 text-ink shadow-xl;
+  }
+
+  .nav-link {
+    @apply relative rounded-md px-3 py-2 text-sm text-slate-300 transition hover:bg-white/5 hover:text-white;
+  }
+  .nav-link-active {
+    @apply bg-white/10 text-teal-bright shadow-none;
+  }
+  .nav-link-active::before {
+    content: '';
+    @apply absolute left-0 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-r-full bg-teal-bright shadow-glow-sm;
+  }
+}
