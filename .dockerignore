@@ -1,0 +1,32 @@
+# Keep the build context small and secret-free.
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Node / build outputs (reinstalled/rebuilt in the image)
+web/node_modules
+web/dist
+node_modules
+
+# Go / local binaries
+*.exe
+subport
+subport-app/
+
+# Local scratch, logs, dumps
+_*
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.stale
+post.txt
+tools/
+scripts/__pycache__/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
