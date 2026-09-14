@@ -3,8 +3,8 @@
 Agent 账号转 API 的网关。目标是**稳定** —— 不要总是断。
 
 > 当前状态：**v0.1.0，可运行**。网关内核、横向故障转移、首字节不重放、SSE 流式透传、断流补偿、
-> API key 鉴权、按用户额度预留与结算、分类价目表、两个前端控制台——都已跑通并有实机验证。
-> 默认种子账号连的仍是自带的假上游（`provider=mock`），接真实供应商见「接上游供应商」。详见文末「已知边界」。
+> API key 鉴权、按用户额度预留与结算、分类价目表、PostgreSQL/SQLite、管理端和用户控制台——都已接通。
+> 默认仍保留 `provider=mock` 的假上游做回归；Claude、Codex、Antigravity 和 OpenAI-compatible 可绑定真实账号。详见文末「已知边界」。
 
 ## 这个项目是怎么来的
 
@@ -39,14 +39,17 @@ new-api 原生的重试是「逐档下降」—— 第 N 次重试直接取第 N
 cmd/subport/           入口，只做装配
 internal/
   model/               共享类型：User APIKey UsageLog Session Account
-  store/               持久化（SQLite）← 换存储只动这一个目录
+  store/               持久化（SQLite / PostgreSQL）
   gateway/             调度器 + failover + relay ← 项目的核心
   httpapi/             路由 + 鉴权 + 用户维度隔离的 console 接口
-web/
-  shared/app.css       两个端共用的样式
-  admin/               管理端（运维用）
-  console/             用户端（客户用，开发中）
-docs/                  MERGE_REPORT.md 等分析产物
+web/                   Vue 前端（管理端 + 用户控制台，单页应用）
+  src/views/           管理端页面（账号池 / 渠道 / 路由 / 密钥 / 用户 / 用量）
+  src/views/console/   用户控制台页面（充值 / 密钥 / 用量 / 模型 / 我的）
+  src/components/       两端共用组件
+  src/api/client.ts    两端共用的 API 客户端
+docs/                  设计与运维文档
+scripts/               Python 辅助脚本（会话换取、冒烟测试）
+tools/                 一次性运维 CLI（//go:build ignore）
 ```
 
 **三个端共用一套后端、一个域名，按路由分**，不是三个项目。拆开只会换来跨域、三套鉴权、三份部署，安全边界靠的是角色和数据过滤，不是仓库数量。
@@ -61,13 +64,13 @@ docs/                  MERGE_REPORT.md 等分析产物
 go run ./cmd/subport
 ```
 
-打开 <http://127.0.0.1:8080/admin/index.html>。后端会同时托管静态前端，不需要另起 web server。
+打开 <http://127.0.0.1:8080/login>。后端会同时托管 Vue 前端，不需要另起 web server。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `SUBPORT_ADDR` | `:8080` | 监听地址 |
 | `SUBPORT_SELF_URL` | 由 ADDR 推导 | 演示上游的地址；不要写死端口 |
-| `SUBPORT_WEB` | `web` | 静态资源目录 |
+| `SUBPORT_WEB` | `web/dist` | 静态资源目录 |
 
 ## 看 failover 真的发生
 
@@ -227,10 +230,13 @@ UPDATE users SET quota_reserved = quota_reserved + ?
 |---|---|
 | `mock` | 自带假上游，**默认种子账号全是它**。保留它做回归基线 |
 | `openai` | OpenAI 兼容：`POST {BaseURL}/v1/chat/completions` + `Authorization: Bearer`，并读取上游返回的真实 `usage.total_tokens` |
+| `claude` | Claude Code / Claude.ai OAuth 订阅，使用 Anthropic Messages 适配器 |
+| `codex` | ChatGPT / Codex OAuth 订阅，使用 Codex Responses 适配器 |
+| `antigravity` | Google Antigravity / Cloud Code OAuth 订阅 |
 
 未知 provider **直接报错，不会退回 mock**——否则它看起来在工作，实际什么都没连。
 
-凭据只从环境变量读，**不入库、不出现在任何 API 响应里**：
+凭据可以从环境变量/本地授权文件引导，也可以按账号隔离保存到 `account_credentials`。管理 API 只返回存在标记和已过滤的非敏感元数据，绝不返回 token 或 Cookie 原文；生产部署应同时依赖数据库磁盘加密和最小权限：
 
 | 变量 | 说明 |
 |---|---|
@@ -242,17 +248,15 @@ UPDATE users SET quota_reserved = quota_reserved + ?
 
 接一个真实账号，`provider` 和 `base_url` **必须同时设对**：种子账号叫 "OpenAI primary (demo)" 但 `provider=mock`，因为它们指向的是本进程的假上游。把 provider 改成 `openai` 却不改 base_url，请求就会去假上游要 `/v1/chat/completions`，然后整条链路以 "no healthy account" 失败——这个坑我们已经踩过一次了。
 
-Anthropic 的 `/v1/messages` + `x-api-key` 形状不同，还没写适配器；加它只需要新增一个 provider 实现，不用动调度器。
-
 ## 已知边界（诚实清单）
 
-- **上游是模拟的。** `/mock/upstream` 是自带的假上游，还没接真实模型供应商。`callUpstream` 已经是真实 HTTP 调用，换掉 BaseURL 就能接真的。
+- `/mock/upstream` 仍是自带假上游，只用于演示和回归；真实账号是否可用取决于对应订阅、OAuth 凭据和上游权限。
 - **计费优先用上游返回的 usage**；上游没给才退回按响应字符数估算。注意 0 被当作「未知」而不是「免费」，否则不报 usage 的供应商会导致完全不计费。
-- **存储是 SQLite**（`modernc.org/sqlite`，纯 Go 无需 CGO），只有这一条写入路径。早先的 JSON 双写已经拆掉——两个写者两份状态、没有东西保证它们相等，正是存储层该防的事。`Store` 是接口层：换 SQLite 时 `gateway/` 和 `httpapi/` 一行都没动，换 Postgres 同理。
-- **单机 SQLite，还不是多实例。** 已开 WAL + busy_timeout，事务和并发有了，但多进程共享同一个文件仍不合适：额度预留的启动清零就是按单实例写的。要横向扩得换 Postgres，并把清零改成按实例身份来做。
+- 无 PostgreSQL 环境变量时使用 SQLite（`modernc.org/sqlite`）；配置 `DATABASE_URL` 或 `PGHOST` 后使用 PostgreSQL，详见 [`docs/POSTGRES.md`](docs/POSTGRES.md)。
+- SQLite 模式仍按单实例设计；多进程不要共享同一个 SQLite 文件。
 - **密码哈希是 SHA-256 加盐，不是 bcrypt/argon2。** 标准库能做到的上限。上线前应换成 argon2id。
-- **前端只读。** 新建/编辑按钮都禁用，等接口定稿。用户端 `/console` 还在做。
-- 计费结算、发卡兑换还没开始。断流补偿已实现（见上方「断流补偿」）。
+- Claude 与 Codex 的 `stream:true` 当前会先完成上游调用，再输出 OpenAI 形状的 SSE；真正逐帧透传仍待实现。OpenAI-compatible 已逐帧透传。
+- 充值已接 Alipay 流程并提供开发用 mock；正式部署仍需真实商户配置和回调验签配置。
 
 ## Claude.ai subscription
 

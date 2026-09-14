@@ -129,7 +129,7 @@ func PublicKey(k APIKey) map[string]any {
 }
 
 // PublicAccount is the admin view, shaped to the front-end contract in
-// web/admin/README.md. cred supplies presence flags only — token values are
+// the admin front-end contract. cred supplies presence flags only — token values are
 // never copied into the returned map.
 func PublicAccount(a Account, cred AccountCredential) map[string]any {
 	state := "healthy"

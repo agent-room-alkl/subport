@@ -244,7 +244,7 @@ func main() {
 		}
 	}
 
-	api := httpapi.New(st, sched, invite, env("SUBPORT_WEB", "web/admin-vue/dist"), compCfg)
+	api := httpapi.New(st, sched, invite, env("SUBPORT_WEB", "web/dist"), compCfg)
 	httpSrv := &http.Server{Addr: addr, Handler: api}
 
 	go func() {

@@ -35,9 +35,20 @@ subport.exe
 .antigravity_project_id
 
 
-# Local scratch / smoke artifacts
+# Local scratch / smoke artifacts (underscore-prefixed probes, logs, dumps)
 _*.log
 _*.txt
+_*.py
+_*.json
+_*.b64
 _smoke_*.json
+_apply_features/
+_admin_wip/
+_claude_replay/
 *.exe~
+
+# Leaked/captured credentials and stale tokens — never commit
+*.stale
+post.txt
+.claude_cookie*
 
