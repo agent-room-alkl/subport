@@ -38,14 +38,17 @@ def pkce() -> tuple[str, str, str]:
     return verifier, challenge, state
 
 
-def browser_headers() -> dict:
-    return {
+def browser_headers(cookie_header: str = "") -> dict:
+    headers = {
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
         "Origin": "https://claude.ai",
         "Referer": "https://claude.ai/new",
     }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return headers
 
 
 
@@ -123,11 +126,11 @@ def fail(code: str, msg: str, exit_code: int = 2, *, step: str = "", upstream_st
     raise SystemExit(exit_code)
 
 
-def fetch_org(session: cffi_requests.Session, session_key: str) -> str:
+def fetch_org(session: cffi_requests.Session, session_key: str, cookie_header: str = "") -> str:
     r = session.get(
         f"{CLAUDE_AI}/api/organizations",
-        headers=browser_headers(),
-        cookies={"sessionKey": session_key},
+        headers=browser_headers(cookie_header),
+        cookies=None if cookie_header else {"sessionKey": session_key},
         timeout=60,
     )
     text = r.text or ""
@@ -154,7 +157,7 @@ def fetch_org(session: cffi_requests.Session, session_key: str) -> str:
     return orgs[0]["uuid"]
 
 
-def authorize(session: cffi_requests.Session, session_key: str, org: str, challenge: str, state: str) -> str:
+def authorize(session: cffi_requests.Session, session_key: str, org: str, challenge: str, state: str, cookie_header: str = "") -> str:
     url = f"{CLAUDE_AI}/v1/oauth/{org}/authorize"
     payload = {
         "response_type": "code",
@@ -166,8 +169,14 @@ def authorize(session: cffi_requests.Session, session_key: str, org: str, challe
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
-    headers = {**browser_headers(), "Content-Type": "application/json", "Accept": "application/json"}
-    r = session.post(url, json=payload, headers=headers, cookies={"sessionKey": session_key}, timeout=60)
+    headers = {**browser_headers(cookie_header), "Content-Type": "application/json", "Accept": "application/json"}
+    r = session.post(
+        url,
+        json=payload,
+        headers=headers,
+        cookies=None if cookie_header else {"sessionKey": session_key},
+        timeout=60,
+    )
     text = r.text or ""
     ct = r.headers.get("content-type") or r.headers.get("Content-Type") or ""
     print(
@@ -285,15 +294,19 @@ def main() -> None:
         fail("exchange_failed", "invalid stdin JSON", 1)
     session_key = (inp.get("session_key") or "").strip()
     org_uuid = (inp.get("org_uuid") or "").strip()
+    cookie_header = (inp.get("cookie") or "").strip()
     if not session_key:
         fail("exchange_failed", "session_key required", 1)
+
+    # Safe diagnostic only; never emit the Cookie or sessionKey values.
+    print(f"cookie_mode={'full' if cookie_header else 'session_only'}", file=sys.stderr)
 
     session = cffi_requests.Session(impersonate=IMPERSONATE)
     try:
         if not org_uuid:
-            org_uuid = fetch_org(session, session_key)
+            org_uuid = fetch_org(session, session_key, cookie_header)
         verifier, challenge, state = pkce()
-        code = authorize(session, session_key, org_uuid, challenge, state)
+        code = authorize(session, session_key, org_uuid, challenge, state, cookie_header)
         tok = exchange_code(session, code, verifier)
     except SystemExit:
         raise

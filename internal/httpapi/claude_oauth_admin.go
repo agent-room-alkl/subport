@@ -113,7 +113,16 @@ func (s *Server) handleClaudeOAuthExchange(w http.ResponseWriter, r *http.Reques
 	}
 
 	exchangeID := shortExchangeID()
-	info, err := gateway.ExchangeClaudeSessionKey(sessionKey, strings.TrimSpace(in.OrgUUID))
+	fullCookie := ""
+	if cred, cerr := s.Store.GetCredential(accountID); cerr == nil {
+		candidate := model.CookieFromExtraJSON(cred.ExtraJSON)
+		// Never combine the entered sessionKey with a different row/account's
+		// browser Cookie. Exact value equality is the isolation boundary.
+		if model.SessionKeyFromCookieHeader(candidate) == sessionKey {
+			fullCookie = candidate
+		}
+	}
+	info, err := gateway.ExchangeClaudeSessionKeyWithCookie(sessionKey, strings.TrimSpace(in.OrgUUID), fullCookie)
 	if err != nil {
 		code := "exchange_failed"
 		step := "unknown"

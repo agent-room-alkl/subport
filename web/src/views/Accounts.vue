@@ -916,6 +916,9 @@ onUnmounted(() => {
         授权第二个订阅前请先退出 claude.ai，或用无痕窗口登录目标账号，再粘贴该账号的 sessionKey。
         否则浏览器 Cookie 仍是旧账号，会导致串号授权。
       </p>
+      <p class="text-xs text-slatex bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+        Azure 环境建议先为本账号保存完整 Cookie。若其中的 sessionKey 与下方输入一致，交换时会自动携带同账号完整 Cookie，提升通过 Cloudflare 校验的成功率。
+      </p>
       <div>
         <label class="label">sessionKey</label>
         <textarea

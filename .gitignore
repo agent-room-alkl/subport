@@ -5,6 +5,8 @@ subport-data.json
 Thumbs.db
 .env
 node_modules/
+__pycache__/
+*.py[cod]
 
 # Local workspace only (not part of the GitHub tree)
 _ref/

@@ -110,6 +110,19 @@ func CookieFromExtraJSON(extraJSON string) string {
 	return ""
 }
 
+// SessionKeyFromCookieHeader returns the sessionKey value from a pasted Cookie
+// request header. It is used only for account-isolation checks and must never
+// be logged or returned by an API.
+func SessionKeyFromCookieHeader(cookieHeader string) string {
+	for _, part := range strings.Split(cookieHeader, ";") {
+		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(name), "sessionKey") {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 // CredentialHasCookie reports whether a non-empty cookie is stored for this credential.
 func CredentialHasCookie(c AccountCredential) bool {
 	return CookieFromExtraJSON(c.ExtraJSON) != ""

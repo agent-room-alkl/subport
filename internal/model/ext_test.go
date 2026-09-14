@@ -34,6 +34,16 @@ func TestMergeClaudeCookieIdentityClearDoesNotExposeCookie(t *testing.T) {
 	}
 }
 
+func TestSessionKeyFromCookieHeader(t *testing.T) {
+	got := SessionKeyFromCookieHeader("foo=1; SESSIONKEY=sk-ant-sid01-example; cf_clearance=challenge")
+	if got != "sk-ant-sid01-example" {
+		t.Fatalf("unexpected sessionKey: %q", got)
+	}
+	if got := SessionKeyFromCookieHeader("foo=1; cf_clearance=challenge"); got != "" {
+		t.Fatalf("expected no sessionKey, got %q", got)
+	}
+}
+
 func toTestString(v any) string {
 	if m, ok := v.(map[string]any); ok {
 		out := ""

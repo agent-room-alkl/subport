@@ -482,6 +482,13 @@ func isClaudeCloudflareErr(err error) bool {
 // Tries the native Go client first; on Cloudflare blocks, falls back once to the
 // curl_cffi chrome131 helper at scripts/claude_session_exchange.py.
 func ExchangeClaudeSessionKey(sessionKey, orgUUID string) (*ClaudeOAuthTokenInfo, error) {
+	return ExchangeClaudeSessionKeyWithCookie(sessionKey, orgUUID, "")
+}
+
+// ExchangeClaudeSessionKeyWithCookie may pass a full, same-account Cookie to
+// the curl_cffi fallback. This preserves Cloudflare/device cookies that are
+// absent when only sessionKey is sent from a data-center egress address.
+func ExchangeClaudeSessionKeyWithCookie(sessionKey, orgUUID, cookieHeader string) (*ClaudeOAuthTokenInfo, error) {
 	sessionKey = strings.TrimSpace(sessionKey)
 	if sessionKey == "" {
 		return nil, &ClaudeExchangeError{Code: "exchange_failed", Message: "session_key required"}
@@ -490,7 +497,7 @@ func ExchangeClaudeSessionKey(sessionKey, orgUUID string) (*ClaudeOAuthTokenInfo
 	if err != nil {
 		if isClaudeCloudflareErr(err) || forceClaudePythonExchange() {
 			log.Printf("claude oauth: native exchange blocked or forced; trying curl_cffi helper")
-			pair, err = claudeExchangeSessionViaPython(sessionKey, strings.TrimSpace(orgUUID))
+			pair, err = claudeExchangeSessionViaPython(sessionKey, strings.TrimSpace(orgUUID), cookieHeader)
 		}
 		if err != nil {
 			return nil, classifyClaudeExchangeErr(err)
@@ -513,7 +520,7 @@ func forceClaudePythonExchange() bool {
 	return v == "1" || v == "true" || v == "yes"
 }
 
-func claudeExchangeSessionViaPython(sessionKey, orgUUID string) (claudeTokenResponse, error) {
+func claudeExchangeSessionViaPython(sessionKey, orgUUID, cookieHeader string) (claudeTokenResponse, error) {
 	var zero claudeTokenResponse
 	script, err := findClaudeExchangeScript()
 	if err != nil {
@@ -523,6 +530,9 @@ func claudeExchangeSessionViaPython(sessionKey, orgUUID string) (claudeTokenResp
 	payload := map[string]string{"session_key": sessionKey}
 	if orgUUID != "" {
 		payload["org_uuid"] = orgUUID
+	}
+	if strings.TrimSpace(cookieHeader) != "" {
+		payload["cookie"] = strings.TrimSpace(cookieHeader)
 	}
 	body, _ := json.Marshal(payload)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
