@@ -27,8 +27,8 @@ const (
 	claudeAPIVersion     = "2023-06-01"
 	// Matches sub2api's MessageBetaHeaderNoTools / DefaultBetaHeader subset:
 	// Claude Code-scoped OAuth requires the claude-code + oauth betas.
-	claudeOAuthBeta = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
-	claudeCLIUA     = "claude-cli/2.1.258 (external, cli)"
+	claudeOAuthBeta    = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
+	claudeCLIUA        = "claude-cli/2.1.258 (external, cli)"
 	claudeDefaultModel = "claude-sonnet-4-5"
 )
 
@@ -77,13 +77,14 @@ func claudeCredential() string {
 }
 
 func claudeCredentialFor(accountID string) string {
-	// DB/cache -> runtime -> env/files.
-	if v := accountAccessToken(accountID); v != "" {
-		return v
+	// Per-account isolation: non-empty accountID uses only that account's cache.
+	// Global runtime/env fallback is only for legacy empty accountID paths.
+	accountID = trimSpace(accountID)
+	if accountID != "" {
+		return accountAccessToken(accountID)
 	}
 	return claudeCredential()
 }
-
 
 func claudeBaseURL(a model.Account) string {
 	if strings.TrimSpace(a.BaseURL) != "" {
@@ -167,9 +168,12 @@ func (claudeProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
 	key := claudeCredentialFor(a.ID)
+	if key == "" {
+		return Reply{}, RelayError{Err: fmt.Errorf("account has no credentials"), FirstByteSent: false}
+	}
 	setClaudeHeaders(httpReq, key)
 
-	resp, err := HTTPClientFor(a).Do(httpReq)
+	resp, err := upstreamClient.Do(httpReq)
 	if err != nil {
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
@@ -180,15 +184,17 @@ func (claudeProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 	_ = json.Unmarshal(raw, &out)
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		// One refresh attempt when a refresh token is available.
+		// One refresh attempt using this account's tokens only.
+		HydrateRuntimeFromAccount(a.ID, "claude")
 		if refreshed, rerr := claudeTryRefresh(); rerr == nil && refreshed {
+			SetAccountCredential(a.ID, claudeRuntimeAccessToken(), claudeRefreshToken(), accountExtraJSON(a.ID), claudeRuntimeExpiresRFC3339())
 			key = claudeCredentialFor(a.ID)
 			httpReq2, err2 := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 			if err2 != nil {
 				return Reply{}, RelayError{Err: err2, FirstByteSent: false}
 			}
 			setClaudeHeaders(httpReq2, key)
-			resp2, err2 := HTTPClientFor(a).Do(httpReq2)
+			resp2, err2 := upstreamClient.Do(httpReq2)
 			if err2 != nil {
 				return Reply{}, RelayError{Err: err2, FirstByteSent: false}
 			}

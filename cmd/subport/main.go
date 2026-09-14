@@ -4,12 +4,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,7 +28,41 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+// loadDotEnv loads KEY=VALUE pairs from path into the process env if not already set.
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		i := strings.IndexByte(line, '=')
+		if i <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:i])
+		v := strings.TrimSpace(line[i+1:])
+		if len(v) >= 2 {
+			if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
+				v = v[1 : len(v)-1]
+			}
+		}
+		// An explicitly empty variable is still an override (notably
+		// SUBPORT_INVITE_CODE="" means open registration).
+		if _, exists := os.LookupEnv(k); !exists {
+			_ = os.Setenv(k, v)
+		}
+	}
+}
+
 func main() {
+	loadDotEnv(".env")
+
 	addr := env("SUBPORT_ADDR", ":8080")
 
 	// The demo upstream is served by this same process, so the seeded accounts
@@ -169,7 +205,15 @@ func main() {
 	sched := gateway.NewScheduler(st.Accounts())
 	sched.SetModelRoutes(st.ListModelRoutes())
 	sched.SetHealthStore(st)
-	gateway.HydrateProxies(st.ListProxies())
+	// Model aliases + fallbacks (DB JSON, optional file override).
+	if raw := st.GetModelAliasesJSON(); raw != "" {
+		if err := gateway.LoadModelAliasConfigJSON(raw); err != nil {
+			log.Printf("model-aliases: stored JSON invalid: %v", err)
+		}
+	}
+	if err := gateway.LoadModelAliasConfigFile(env("SUBPORT_MODEL_ALIASES_FILE", "model_aliases.json")); err != nil {
+		log.Printf("model-aliases: file config invalid: %v", err)
+	}
 
 	stopBG := make(chan struct{})
 	gateway.StartTokenRefreshLoop(stopBG, gateway.DefaultRefreshInterval, store.TokenRefreshBridge{Store: st})
@@ -216,12 +260,11 @@ func main() {
 		}
 	}()
 
-	log.Printf("subport listening on %s (store=%s, self=%s)", addr, dbPath, selfURL)
+	log.Printf("subport listening on %s (store=%s, self=%s)", addr, st.Driver(), selfURL)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }
-
 
 // syncBootstrapCredentials upserts runtime/env tokens into account_credentials
 // and the gateway cache so admin UI flags stay in sync. Never logs token values.

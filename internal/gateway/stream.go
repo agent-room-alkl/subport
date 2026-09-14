@@ -23,32 +23,38 @@ func StreamUpstream(a model.Account, req ChatRequest, w http.ResponseWriter) (in
 
 func (s *Scheduler) RelayStream(req ChatRequest, w http.ResponseWriter) (Result, error) {
 	var lastErr error
-	for attempt := 0; attempt < MaxAttempts; attempt++ {
-		acct, ok := s.Pick(attempt, req.Model)
-		if !ok {
+	models := ModelAttemptChain(req.Model)
+	totalAttempts := 0
+	for mi, modelName := range models {
+		try := req
+		try.Model = modelName
+		for attempt := 0; attempt < MaxAttempts; attempt++ {
+			acct, ok := s.Pick(attempt, try.Model)
+			if !ok {
+				continue
+			}
+			totalAttempts++
+			tokens, err := StreamUpstream(acct, try, w)
+			status := "200"
+			if err != nil {
+				status = "failed"
+			}
+			log.Printf("stream attempt=%d model=%s account=%s provider=%s -> %s", attempt, try.Model, acct.ID, acct.Provider, status)
+			s.NoteUpstreamResult(acct.ID, err)
+			if err == nil {
+				return Result{Account: acct, Tokens: tokens, Attempts: totalAttempts}, nil
+			}
+			lastErr = err
+			if re, ok := err.(RelayError); ok && re.FirstByteSent {
+				writeStreamError(w, re.Error())
+				return Result{Account: acct, Attempts: totalAttempts, Tokens: tokens}, err
+			}
+		}
+		if mi+1 < len(models) && lastErr != nil && IsRetryableUpstreamStatus(lastErr) {
+			log.Printf("stream model-fallback: from=%s to=%s reason=%v", modelName, models[mi+1], lastErr)
 			continue
 		}
-		tokens, err := StreamUpstream(acct, req, w)
-		status := "200"
-		if err != nil {
-			status = "failed"
-		}
-		log.Printf("stream attempt=%d account=%s provider=%s -> %s", attempt, acct.ID, acct.Provider, status)
-		s.NoteUpstreamResult(acct.ID, err)
-		if err == nil {
-			return Result{Account: acct, Tokens: tokens, Attempts: attempt + 1}, nil
-		}
-		lastErr = err
-		if re, ok := err.(RelayError); ok && re.FirstByteSent {
-			// Output already began, so no status code can still be set - the
-			// headers left with the first frame. The only thing the client can
-			// still be told is another frame, so say it in the one shape an
-			// SSE client can parse. Without this the caller gets a truncated
-			// answer and no signal that it was truncated, which is
-			// indistinguishable from the model simply stopping.
-			writeStreamError(w, re.Error())
-			return Result{Account: acct, Attempts: attempt + 1, Tokens: tokens}, err
-		}
+		break
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no healthy account")
@@ -142,11 +148,11 @@ func (openAIProvider) Stream(a model.Account, req ChatRequest, w http.ResponseWr
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
-	key := credentialFor(a.Provider)
+	key := openAICredentialFor(a)
 	if key != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+key)
 	}
-	resp, err := HTTPClientFor(a).Do(httpReq)
+	resp, err := upstreamClient.Do(httpReq)
 	if err != nil {
 		return 0, RelayError{Err: err, FirstByteSent: false}
 	}

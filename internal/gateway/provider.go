@@ -188,12 +188,12 @@ func (openAIProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	key := credentialFor(a.Provider)
+	key := openAICredentialFor(a)
 	if key != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+key)
 	}
 
-	resp, err := HTTPClientFor(a).Do(httpReq)
+	resp, err := upstreamClient.Do(httpReq)
 	if err != nil {
 		// No response at all: safe to try the next account.
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
@@ -235,4 +235,14 @@ func (openAIProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 		Content: out.Choices[0].Message.Content,
 		Tokens:  out.Usage.TotalTokens,
 	}, nil
+}
+
+// openAICredentialFor prefers the credential attached to this concrete
+// account. The provider-level environment key remains a deliberate fallback
+// for installations that configure one shared OpenAI-compatible key.
+func openAICredentialFor(a model.Account) string {
+	if key := accountAccessToken(a.ID); strings.TrimSpace(key) != "" {
+		return key
+	}
+	return credentialFor(a.Provider)
 }

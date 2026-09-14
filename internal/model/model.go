@@ -85,7 +85,6 @@ type Account struct {
 	ConsecutiveTimeouts int     `json:"consecutive_timeouts"`
 	Consecutive403      int     `json:"consecutive_403"`
 	Consecutive429      int     `json:"consecutive_429"`
-	ProxyID             string  `json:"proxy_id"`
 }
 
 // CompensationConfig controls the auto-compensation engine. A stream cut is
@@ -116,8 +115,8 @@ func PublicUser(u User) map[string]any {
 		"id": u.ID, "username": u.Username, "role": u.Role,
 		"quota_total": u.QuotaTotal, "quota_used": u.QuotaUsed,
 		"quota_reserved": u.QuotaReserved,
-		"remaining": remaining,
-		"created_at": u.CreatedAt,
+		"remaining":      remaining,
+		"created_at":     u.CreatedAt,
 	}
 }
 
@@ -141,18 +140,21 @@ func PublicAccount(a Account, cred AccountCredential) map[string]any {
 	if strings.TrimSpace(cred.ExpiresAt) != "" {
 		expires = cred.ExpiresAt
 	}
-	return map[string]any{
+	out := map[string]any{
 		"id": a.ID, "label": a.Name, "provider": a.Provider,
-		"tier": a.Priority, "state": state, "load": a.Load,
+		"base_url": a.BaseURL,
+		"tier":     a.Priority, "state": state, "load": a.Load,
 		"cooldown_until": a.CooldownUntil, "last_error": a.LastError,
 		"consecutive_timeouts": a.ConsecutiveTimeouts,
 		"consecutive_403":      a.Consecutive403,
 		"consecutive_429":      a.Consecutive429,
-		"proxy_id":            a.ProxyID,
-		"has_access_token":    strings.TrimSpace(cred.AccessToken) != "",
-		"has_refresh_token":   strings.TrimSpace(cred.RefreshToken) != "",
-		"expires_at":          expires,
+		"has_access_token":     strings.TrimSpace(cred.AccessToken) != "",
+		"has_refresh_token":    strings.TrimSpace(cred.RefreshToken) != "",
+		"has_cookie":           CredentialHasCookie(cred),
+		"expires_at":           expires,
 	}
+	if identity := ClaudeCookieIdentityFromExtraJSON(cred.ExtraJSON); identity.VerifiedAt != "" {
+		out["cookie_identity"] = identity
+	}
+	return out
 }
-
-

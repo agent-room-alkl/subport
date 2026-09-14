@@ -9,7 +9,7 @@ import (
 )
 
 func (s *Store) sqliteListUsers() ([]model.User, error) {
-	rows, err := s.db.Query(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,quota_reserved,created_at FROM users ORDER BY created_at ASC`)
+	rows, err := s.query(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,quota_reserved,created_at FROM users ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -17,11 +17,11 @@ func (s *Store) sqliteListUsers() ([]model.User, error) {
 	var out []model.User
 	for rows.Next() {
 		var u model.User
-		var created string
+		var created sqlTime
 		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Salt, &u.Role, &u.QuotaTotal, &u.QuotaUsed, &u.QuotaReserved, &created); err != nil {
 			return nil, err
 		}
-		u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		u.CreatedAt = created.Time()
 		out = append(out, u)
 	}
 	return out, rows.Err()
@@ -29,19 +29,19 @@ func (s *Store) sqliteListUsers() ([]model.User, error) {
 
 // sqliteAddQuotaCredit raises quota_total so historical quota_used stays meaningful.
 func (s *Store) sqliteAddQuotaCredit(userID string, credit int64) (total, used int64, err error) {
-	res, err := s.db.Exec(`UPDATE users SET quota_total = quota_total + ? WHERE id=?`, credit, userID)
+	res, err := s.exec(`UPDATE users SET quota_total = quota_total + ? WHERE id=?`, credit, userID)
 	if err != nil {
 		return 0, 0, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return 0, 0, ErrNotFound
 	}
-	err = s.db.QueryRow(`SELECT quota_total, quota_used FROM users WHERE id=?`, userID).Scan(&total, &used)
+	err = s.queryRow(`SELECT quota_total, quota_used FROM users WHERE id=?`, userID).Scan(&total, &used)
 	return total, used, err
 }
 
 func (s *Store) sqliteCreatePaymentOrder(o model.PaymentOrder) error {
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`INSERT INTO payment_orders(id,user_id,provider,package_id,amount_fiat_cents,currency,quota_credit,status,provider_trade_no,pay_url,idempotency_key,created_at,paid_at,expires_at)
 		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		o.ID, o.UserID, o.Provider, o.PackageID, o.AmountFiatCents, o.Currency, o.QuotaCredit, o.Status,
@@ -52,17 +52,19 @@ func (s *Store) sqliteCreatePaymentOrder(o model.PaymentOrder) error {
 
 func scanPaymentOrder(scanner interface{ Scan(dest ...any) error }) (model.PaymentOrder, error) {
 	var o model.PaymentOrder
+	var created sqlTimeText
 	err := scanner.Scan(
 		&o.ID, &o.UserID, &o.Provider, &o.PackageID, &o.AmountFiatCents, &o.Currency, &o.QuotaCredit,
-		&o.Status, &o.ProviderTradeNo, &o.PayURL, &o.IdempotencyKey, &o.CreatedAt, &o.PaidAt, &o.ExpiresAt,
+		&o.Status, &o.ProviderTradeNo, &o.PayURL, &o.IdempotencyKey, &created, &o.PaidAt, &o.ExpiresAt,
 	)
+	o.CreatedAt = created.String()
 	return o, err
 }
 
 const paymentOrderCols = `id,user_id,provider,package_id,amount_fiat_cents,currency,quota_credit,status,provider_trade_no,pay_url,idempotency_key,created_at,paid_at,expires_at`
 
 func (s *Store) sqliteGetPaymentOrder(id string) (model.PaymentOrder, error) {
-	o, err := scanPaymentOrder(s.db.QueryRow(`SELECT `+paymentOrderCols+` FROM payment_orders WHERE id=?`, id))
+	o, err := scanPaymentOrder(s.queryRow(`SELECT `+paymentOrderCols+` FROM payment_orders WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
@@ -70,7 +72,7 @@ func (s *Store) sqliteGetPaymentOrder(id string) (model.PaymentOrder, error) {
 }
 
 func (s *Store) sqliteGetPaymentOrderByIdem(userID, key string) (model.PaymentOrder, error) {
-	o, err := scanPaymentOrder(s.db.QueryRow(`SELECT `+paymentOrderCols+` FROM payment_orders WHERE user_id=? AND idempotency_key=?`, userID, key))
+	o, err := scanPaymentOrder(s.queryRow(`SELECT `+paymentOrderCols+` FROM payment_orders WHERE user_id=? AND idempotency_key=?`, userID, key))
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
@@ -78,14 +80,14 @@ func (s *Store) sqliteGetPaymentOrderByIdem(userID, key string) (model.PaymentOr
 }
 
 func (s *Store) sqliteUpdateOrderPayURL(id, payURL string) error {
-	_, err := s.db.Exec(`UPDATE payment_orders SET pay_url=? WHERE id=?`, payURL, id)
+	_, err := s.exec(`UPDATE payment_orders SET pay_url=? WHERE id=?`, payURL, id)
 	return err
 }
 
 // sqliteMarkOrderPaidAndCredit transitions pending→paid once, inserts a topup,
 // and raises quota_total. A second call for the same order is a no-op success.
 func (s *Store) sqliteMarkOrderPaidAndCredit(orderID, tradeNo, source, operatorID, note string) (model.PaymentOrder, model.QuotaTopup, bool, error) {
-	tx, err := s.db.Begin()
+	tx, err := s.begin()
 	if err != nil {
 		return model.PaymentOrder{}, model.QuotaTopup{}, false, err
 	}
@@ -101,12 +103,16 @@ func (s *Store) sqliteMarkOrderPaidAndCredit(orderID, tradeNo, source, operatorI
 	if o.Status == model.OrderPaid {
 		// Already credited — return existing topup if any.
 		var t model.QuotaTopup
+		var created sqlTimeText
 		terr := tx.QueryRow(
 			`SELECT id,user_id,order_id,credit,source,operator_id,note,created_at FROM quota_topups WHERE order_id=?`,
 			orderID,
-		).Scan(&t.ID, &t.UserID, &t.OrderID, &t.Credit, &t.Source, &t.OperatorID, &t.Note, &t.CreatedAt)
+		).Scan(&t.ID, &t.UserID, &t.OrderID, &t.Credit, &t.Source, &t.OperatorID, &t.Note, &created)
 		if terr != nil && !errors.Is(terr, sql.ErrNoRows) {
 			return o, t, false, terr
+		}
+		if terr == nil {
+			t.CreatedAt = created.String()
 		}
 		return o, t, false, nil
 	}
@@ -161,7 +167,7 @@ func (s *Store) sqliteMarkOrderPaidAndCredit(orderID, tradeNo, source, operatorI
 }
 
 func (s *Store) sqliteInsertTopup(t model.QuotaTopup) error {
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`INSERT INTO quota_topups(id,user_id,order_id,credit,source,operator_id,note,created_at) VALUES(?,?,?,?,?,?,?,?)`,
 		t.ID, t.UserID, t.OrderID, t.Credit, t.Source, t.OperatorID, t.Note, t.CreatedAt,
 	)
@@ -172,7 +178,7 @@ func (s *Store) sqliteListTopups(limit int) ([]model.QuotaTopup, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(
+	rows, err := s.query(
 		`SELECT id,user_id,order_id,credit,source,operator_id,note,created_at FROM quota_topups ORDER BY created_at DESC LIMIT ?`,
 		limit,
 	)
@@ -187,7 +193,7 @@ func (s *Store) sqliteListTopupsOf(userID string, limit int) ([]model.QuotaTopup
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(
+	rows, err := s.query(
 		`SELECT id,user_id,order_id,credit,source,operator_id,note,created_at FROM quota_topups WHERE user_id=? ORDER BY created_at DESC LIMIT ?`,
 		userID, limit,
 	)
@@ -202,9 +208,11 @@ func scanTopups(rows *sql.Rows) ([]model.QuotaTopup, error) {
 	var out []model.QuotaTopup
 	for rows.Next() {
 		var t model.QuotaTopup
-		if err := rows.Scan(&t.ID, &t.UserID, &t.OrderID, &t.Credit, &t.Source, &t.OperatorID, &t.Note, &t.CreatedAt); err != nil {
+		var created sqlTimeText
+		if err := rows.Scan(&t.ID, &t.UserID, &t.OrderID, &t.Credit, &t.Source, &t.OperatorID, &t.Note, &created); err != nil {
 			return nil, err
 		}
+		t.CreatedAt = created.String()
 		out = append(out, t)
 	}
 	if out == nil {
@@ -217,7 +225,7 @@ func (s *Store) sqliteListPaymentOrders(limit int) ([]model.PaymentOrder, error)
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT `+paymentOrderCols+` FROM payment_orders ORDER BY created_at DESC LIMIT ?`, limit)
+	rows, err := s.query(`SELECT `+paymentOrderCols+` FROM payment_orders ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}

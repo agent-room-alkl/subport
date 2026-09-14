@@ -29,9 +29,11 @@ func TestCodexAdapterSendsResponsesAPI(t *testing.T) {
 	}))
 	defer stub.Close()
 
-	t.Setenv("SUBPORT_CODEX_ACCESS_TOKEN", "oauth-access-token-test")
-	t.Setenv("SUBPORT_CODEX_ACCOUNT_ID", "acct-test-chatgpt")
 	codexSetRuntime("", "", "", 0)
+	ClearAccountCredential("acct-codex-1")
+	extra, _ := json.Marshal(map[string]string{"chatgpt_account_id": "acct-test-chatgpt"})
+	SetAccountCredential("acct-codex-1", "oauth-access-token-test", "", string(extra), "")
+	defer ClearAccountCredential("acct-codex-1")
 
 	acct := model.Account{ID: "acct-codex-1", Provider: "codex", BaseURL: stub.URL}
 	req := ChatRequest{Model: "gpt-5.5"}

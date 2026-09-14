@@ -9,45 +9,45 @@ import (
 
 func scanSQLiteUser(row *sql.Row) (model.User, error) {
 	var u model.User
-	var created string
+	var created sqlTime
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Salt, &u.Role, &u.QuotaTotal, &u.QuotaUsed, &u.QuotaReserved, &created)
 	if err != nil {
 		return u, err
 	}
-	u.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
-	return u, err
+	u.CreatedAt = created.Time()
+	return u, nil
 }
 
 func (s *Store) sqliteCreateUser(u model.User) error {
-	_, err := s.db.Exec(`INSERT INTO users(id,username,password_hash,password_salt,role,quota_total,quota_used,created_at) VALUES(?,?,?,?,?,?,?,?)`, u.ID, u.Username, u.PasswordHash, u.Salt, u.Role, u.QuotaTotal, u.QuotaUsed, u.CreatedAt.Format(time.RFC3339Nano))
+	_, err := s.exec(`INSERT INTO users(id,username,password_hash,password_salt,role,quota_total,quota_used,created_at) VALUES(?,?,?,?,?,?,?,?)`, u.ID, u.Username, u.PasswordHash, u.Salt, u.Role, u.QuotaTotal, u.QuotaUsed, u.CreatedAt.Format(time.RFC3339Nano))
 	return err
 }
 
 func (s *Store) sqliteUserByName(username string) (model.User, error) {
-	return scanSQLiteUser(s.db.QueryRow(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,quota_reserved,created_at FROM users WHERE username=?`, username))
+	return scanSQLiteUser(s.queryRow(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,quota_reserved,created_at FROM users WHERE username=?`, username))
 }
 
 func (s *Store) sqliteUserByID(id string) (model.User, error) {
-	return scanSQLiteUser(s.db.QueryRow(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,quota_reserved,created_at FROM users WHERE id=?`, id))
+	return scanSQLiteUser(s.queryRow(`SELECT id,username,password_hash,password_salt,role,quota_total,quota_used,quota_reserved,created_at FROM users WHERE id=?`, id))
 }
 
 func (s *Store) sqliteNewSession(sess model.Session) error {
-	_, err := s.db.Exec(`INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)`, sess.Token, sess.UserID, sess.ExpiresAt.Format(time.RFC3339Nano))
+	_, err := s.exec(`INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)`, sess.Token, sess.UserID, sess.ExpiresAt.Format(time.RFC3339Nano))
 	return err
 }
 
 func (s *Store) sqliteSessionUser(token string) (string, time.Time, error) {
-	var userID, expires string
-	err := s.db.QueryRow(`SELECT user_id,expires_at FROM sessions WHERE token=?`, token).Scan(&userID, &expires)
+	var userID string
+	var expires sqlTime
+	err := s.queryRow(`SELECT user_id,expires_at FROM sessions WHERE token=?`, token).Scan(&userID, &expires)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	exp, err := time.Parse(time.RFC3339Nano, expires)
-	return userID, exp, err
+	return userID, expires.Time(), nil
 }
 
 func (s *Store) sqliteDropSession(token string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE token=?`, token)
+	_, err := s.exec(`DELETE FROM sessions WHERE token=?`, token)
 	return err
 }
 
@@ -55,7 +55,7 @@ func (s *Store) sqliteDropSession(token string) error {
 // registered alongside "admin".
 func (s *Store) sqliteUsernameTaken(norm string) (bool, error) {
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE username=?`, norm).Scan(&n)
+	err := s.queryRow(`SELECT COUNT(*) FROM users WHERE username=?`, norm).Scan(&n)
 	return n > 0, err
 }
 

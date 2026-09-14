@@ -8,7 +8,7 @@ import (
 )
 
 func (s *Store) sqliteListChannels() ([]model.Channel, error) {
-	rows, err := s.db.Query(`SELECT id,name,provider,group_name,priority,enabled,models_json,created_at FROM channels ORDER BY priority,name`)
+	rows, err := s.query(`SELECT id,name,provider,group_name,priority,enabled,models_json,created_at FROM channels ORDER BY priority,name`)
 	if err != nil {
 		return nil, err
 	}
@@ -16,11 +16,13 @@ func (s *Store) sqliteListChannels() ([]model.Channel, error) {
 	var out []model.Channel
 	for rows.Next() {
 		var c model.Channel
-		var en int
-		if err := rows.Scan(&c.ID, &c.Name, &c.Provider, &c.GroupName, &c.Priority, &en, &c.ModelsJSON, &c.CreatedAt); err != nil {
+		var en sqlBool
+		var created sqlTimeText
+		if err := rows.Scan(&c.ID, &c.Name, &c.Provider, &c.GroupName, &c.Priority, &en, &c.ModelsJSON, &created); err != nil {
 			return nil, err
 		}
-		c.Enabled = en != 0
+		c.Enabled = en.Bool()
+		c.CreatedAt = created.String()
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -28,14 +30,19 @@ func (s *Store) sqliteListChannels() ([]model.Channel, error) {
 
 func (s *Store) sqliteGetChannel(id string) (model.Channel, error) {
 	var c model.Channel
-	var en int
-	err := s.db.QueryRow(`SELECT id,name,provider,group_name,priority,enabled,models_json,created_at FROM channels WHERE id=?`, id).
-		Scan(&c.ID, &c.Name, &c.Provider, &c.GroupName, &c.Priority, &en, &c.ModelsJSON, &c.CreatedAt)
+	var en sqlBool
+	var created sqlTimeText
+	err := s.queryRow(`SELECT id,name,provider,group_name,priority,enabled,models_json,created_at FROM channels WHERE id=?`, id).
+		Scan(&c.ID, &c.Name, &c.Provider, &c.GroupName, &c.Priority, &en, &c.ModelsJSON, &created)
 	if err == sql.ErrNoRows {
 		return c, ErrNotFound
 	}
-	c.Enabled = en != 0
-	return c, err
+	if err != nil {
+		return c, err
+	}
+	c.Enabled = en.Bool()
+	c.CreatedAt = created.String()
+	return c, nil
 }
 
 func (s *Store) sqliteUpsertChannel(c model.Channel) error {
@@ -48,18 +55,18 @@ func (s *Store) sqliteUpsertChannel(c model.Channel) error {
 	if c.ModelsJSON == "" {
 		c.ModelsJSON = "[]"
 	}
-	_, err := s.db.Exec(`
+	_, err := s.exec(`
 INSERT INTO channels(id,name,provider,group_name,priority,enabled,models_json,created_at)
 VALUES(?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
   name=excluded.name, provider=excluded.provider, group_name=excluded.group_name,
   priority=excluded.priority, enabled=excluded.enabled, models_json=excluded.models_json
-`, c.ID, c.Name, c.Provider, c.GroupName, c.Priority, boolInt(c.Enabled), c.ModelsJSON, c.CreatedAt)
+`, c.ID, c.Name, c.Provider, c.GroupName, c.Priority, s.boolArg(c.Enabled), c.ModelsJSON, c.CreatedAt)
 	return err
 }
 
 func (s *Store) sqliteDeleteChannel(id string) error {
-	tx, err := s.db.Begin()
+	tx, err := s.begin()
 	if err != nil {
 		return err
 	}
@@ -79,7 +86,7 @@ func (s *Store) sqliteDeleteChannel(id string) error {
 }
 
 func (s *Store) sqliteListChannelAccounts(channelID string) ([]model.ChannelAccount, error) {
-	rows, err := s.db.Query(`SELECT channel_id,account_id,model_pattern,priority FROM channel_accounts WHERE channel_id=? ORDER BY priority,account_id`, channelID)
+	rows, err := s.query(`SELECT channel_id,account_id,model_pattern,priority FROM channel_accounts WHERE channel_id=? ORDER BY priority,account_id`, channelID)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +103,7 @@ func (s *Store) sqliteListChannelAccounts(channelID string) ([]model.ChannelAcco
 }
 
 func (s *Store) sqliteUpsertChannelAccount(m model.ChannelAccount) error {
-	_, err := s.db.Exec(`
+	_, err := s.exec(`
 INSERT INTO channel_accounts(channel_id,account_id,model_pattern,priority) VALUES(?,?,?,?)
 ON CONFLICT(channel_id, account_id) DO UPDATE SET
   model_pattern=excluded.model_pattern, priority=excluded.priority
@@ -105,7 +112,7 @@ ON CONFLICT(channel_id, account_id) DO UPDATE SET
 }
 
 func (s *Store) sqliteDeleteChannelAccount(channelID, accountID string) error {
-	res, err := s.db.Exec(`DELETE FROM channel_accounts WHERE channel_id=? AND account_id=?`, channelID, accountID)
+	res, err := s.exec(`DELETE FROM channel_accounts WHERE channel_id=? AND account_id=?`, channelID, accountID)
 	if err != nil {
 		return err
 	}

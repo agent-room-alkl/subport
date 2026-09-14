@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 
 	"github.com/agent-room-alkl/subport/internal/model"
@@ -62,6 +63,61 @@ func (s *Store) DeleteCredential(accountID string) error {
 	return s.sqliteDeleteCredential(accountID)
 }
 
+// SetAccountCookie stores a full browser Cookie header string for one account
+// under extra_json (isolated per account_id). cookie must be non-empty after trim.
+// Never log cookie contents.
+func (s *Store) SetAccountCookie(accountID, cookie string) (model.AccountCredential, error) {
+	cookie = strings.TrimSpace(cookie)
+	if cookie == "" {
+		return model.AccountCredential{}, errors.New("cookie required")
+	}
+	cur, err := s.GetCredential(accountID)
+	if err != nil && err != ErrNotFound {
+		return model.AccountCredential{}, err
+	}
+	if err == ErrNotFound {
+		cur = model.AccountCredential{AccountID: accountID}
+	}
+	extra := model.MergeCookieIntoExtraJSON(cur.ExtraJSON, cookie, false)
+	return s.UpsertCredential(accountID, CredentialPatch{ExtraJSON: &extra})
+}
+
+// ClearAccountCookie removes the cookie key from extra_json for one account.
+func (s *Store) ClearAccountCookie(accountID string) (model.AccountCredential, error) {
+	cur, err := s.GetCredential(accountID)
+	if err != nil {
+		if err == ErrNotFound {
+			return model.AccountCredential{AccountID: accountID}, nil
+		}
+		return model.AccountCredential{}, err
+	}
+	extra := model.MergeCookieIntoExtraJSON(cur.ExtraJSON, "", true)
+	return s.UpsertCredential(accountID, CredentialPatch{ExtraJSON: &extra})
+}
+
+// GetAccountCookie returns the stored cookie for accountID. ErrNotFound if none.
+// Never log the return value.
+func (s *Store) GetAccountCookie(accountID string) (string, error) {
+	c, err := s.GetCredential(accountID)
+	if err != nil {
+		return "", err
+	}
+	cookie := model.CookieFromExtraJSON(c.ExtraJSON)
+	if cookie == "" {
+		return "", ErrNotFound
+	}
+	return cookie, nil
+}
+
+// HasAccountCookie reports whether a non-empty cookie is stored for accountID.
+func (s *Store) HasAccountCookie(accountID string) bool {
+	c, err := s.GetCredential(accountID)
+	if err != nil {
+		return false
+	}
+	return model.CredentialHasCookie(c)
+}
+
 // PublicCredentialStatus returns the admin-safe credential view.
 func (s *Store) PublicCredentialStatus(accountID string) map[string]any {
 	c, err := s.GetCredential(accountID)
@@ -74,8 +130,7 @@ func (s *Store) PublicCredentialStatus(accountID string) map[string]any {
 		if json.Unmarshal([]byte(c.ExtraJSON), &obj) == nil {
 			safe := map[string]any{}
 			for k, v := range obj {
-				lk := strings.ToLower(k)
-				if strings.Contains(lk, "token") || strings.Contains(lk, "secret") || strings.Contains(lk, "password") {
+				if model.IsSecretExtraKey(k) {
 					continue
 				}
 				safe[k] = v
@@ -83,6 +138,7 @@ func (s *Store) PublicCredentialStatus(accountID string) map[string]any {
 			out["extra"] = safe
 		}
 	}
+	out["has_cookie"] = model.CredentialHasCookie(c)
 	return out
 }
 
@@ -103,39 +159,6 @@ func (s *Store) AccountByID(id string) (model.Account, error) {
 		return a, ErrNotFound
 	}
 	return a, err
-}
-
-// ---------------------------------------------------------------- proxies
-
-func (s *Store) ListProxies() []model.Proxy {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out, err := s.sqliteListProxies()
-	if err != nil || out == nil {
-		return []model.Proxy{}
-	}
-	return out
-}
-
-func (s *Store) GetProxy(id string) (model.Proxy, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sqliteGetProxy(id)
-}
-
-func (s *Store) UpsertProxy(p model.Proxy) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if p.ID == "" {
-		p.ID = NewID("proxy")
-	}
-	return s.sqliteUpsertProxy(p)
-}
-
-func (s *Store) DeleteProxy(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sqliteDeleteProxy(id)
 }
 
 // ---------------------------------------------------------------- channels
@@ -238,3 +261,104 @@ func (s *Store) GetAccount(id string) (model.Account, error) {
 	return s.AccountByID(id)
 }
 
+// AdminSetKeyEnabled toggles a key by id only (admin path, no user scope).
+func (s *Store) AdminSetKeyEnabled(keyID string, enabled bool) error {
+	return s.sqliteAdminSetKeyEnabled(keyID, enabled)
+}
+
+// AdminDeleteKey deletes a key by id only (admin path).
+func (s *Store) AdminDeleteKey(keyID string) error {
+	return s.sqliteAdminDeleteKey(keyID)
+}
+
+// KeyByIDOnly looks up a key without user scoping (admin).
+func (s *Store) KeyByIDOnly(keyID string) (model.APIKey, error) {
+	k, err := s.sqliteKeyByIDOnly(keyID)
+	if err != nil {
+		return model.APIKey{}, ErrNotFound
+	}
+	return k, nil
+}
+
+// SetRole updates a user's role ("admin" | "user").
+func (s *Store) SetRole(userID, role string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sqliteSetRole(userID, role)
+}
+
+// CountUsers returns total user rows; CountAdmins returns role=admin count.
+func (s *Store) CountUsers() int {
+	n, err := s.sqliteCountUsersByRole("")
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func (s *Store) CountAdmins() int {
+	n, err := s.sqliteCountUsersByRole(model.RoleAdmin)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// UsageByDay returns last N days of usage aggregates (zeros filled).
+func (s *Store) UsageByDay(days int) []UsageDayStat {
+	out, err := s.sqliteUsageByDay(days)
+	if err != nil || out == nil {
+		return []UsageDayStat{}
+	}
+	return out
+}
+
+// UsageByModel returns top models by tokens.
+func (s *Store) UsageByModel(limit int) []UsageModelStat {
+	out, err := s.sqliteUsageByModel(limit)
+	if err != nil || out == nil {
+		return []UsageModelStat{}
+	}
+	return out
+}
+
+// ListAvailableModels returns the curated catalog (all rows for admin).
+func (s *Store) ListAvailableModels() []model.AvailableModel {
+	out, err := s.sqliteListAvailableModels(false)
+	if err != nil || out == nil {
+		return []model.AvailableModel{}
+	}
+	return out
+}
+
+// ListEnabledAvailableModels returns enabled catalog rows for the user console.
+func (s *Store) ListEnabledAvailableModels() []model.AvailableModel {
+	out, err := s.sqliteListAvailableModels(true)
+	if err != nil || out == nil {
+		return []model.AvailableModel{}
+	}
+	return out
+}
+
+// SetAvailableModelEnabled toggles a catalog row.
+func (s *Store) SetAvailableModelEnabled(id string, enabled bool) error {
+	return s.sqliteSetAvailableModelEnabled(id, enabled)
+}
+
+// UpsertAvailableModel inserts or updates a catalog row.
+func (s *Store) UpsertAvailableModel(m model.AvailableModel) error {
+	return s.sqliteUpsertAvailableModel(m)
+}
+
+// UsageSummary returns admin monitoring rollups.
+func (s *Store) UsageSummary(topN int) UsageSummary {
+	out, err := s.sqliteUsageSummary(topN)
+	if err != nil {
+		return UsageSummary{
+			PerUser:      []UsageUserStat{},
+			PerModel:     []UsageModelCostStat{},
+			PerUserModel: []UsageUserModelStat{},
+		}
+	}
+	return out
+}

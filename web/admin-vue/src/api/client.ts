@@ -13,9 +13,19 @@ export function setToken(t: string | null) {
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  code?: string
+  step?: string
+  upstreamStatus?: number
+  exchangeId?: string
+  constructor(status: number, message: string, extra?: { code?: string; step?: string; upstreamStatus?: number; exchangeId?: string }) {
     super(message)
     this.status = status
+    if (extra) {
+      this.code = extra.code
+      this.step = extra.step
+      this.upstreamStatus = extra.upstreamStatus
+      this.exchangeId = extra.exchangeId
+    }
   }
 }
 
@@ -29,11 +39,20 @@ export async function api<T = any>(path: string, opts: RequestInit = {}): Promis
   const res = await fetch(path, { ...opts, headers })
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`
+    let extra: { code?: string; step?: string; upstreamStatus?: number; exchangeId?: string } | undefined
     try {
       const body = await res.json()
       if (body?.error) msg = body.error
+      if (body && (body.code || body.step || body.upstream_status || body.exchange_id)) {
+        extra = {
+          code: body.code,
+          step: body.step,
+          upstreamStatus: body.upstream_status,
+          exchangeId: body.exchange_id,
+        }
+      }
     } catch { /* ignore */ }
-    throw new ApiError(res.status, msg)
+    throw new ApiError(res.status, msg, extra)
   }
   if (res.status === 204) return null as T
   const text = await res.text()
@@ -73,15 +92,6 @@ export type ModelRoute = {
   enabled: boolean
 }
 
-export type Proxy = {
-  id: string
-  name: string
-  type: 'http' | 'socks5' | 'socks5h' | 'socks' | string
-  url: string
-  enabled: boolean
-  created_at?: string
-}
-
 export type Channel = {
   id: string
   name: string
@@ -104,14 +114,39 @@ export const adminApi = {
   overview: () => api('/api/overview'),
 
   accounts: () => api<any[]>('/api/accounts'),
+  createAccount: (body: {
+    id?: string
+    name?: string
+    label?: string
+    provider: string
+    base_url?: string
+    priority?: number
+    healthy?: boolean
+  }) =>
+    api<any>('/api/accounts', { method: 'POST', body: JSON.stringify(body) }),
+  deleteAccount: (id: string) =>
+    api(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   getCredentials: (id: string) => api(`/api/accounts/${encodeURIComponent(id)}/credentials`),
   putCredentials: (id: string, body: Record<string, string | boolean>) =>
     api(`/api/accounts/${encodeURIComponent(id)}/credentials`, {
       method: 'PUT',
       body: JSON.stringify(body),
     }),
-  testAccount: (id: string) =>
-    api(`/api/accounts/${encodeURIComponent(id)}/test`, { method: 'POST', body: '{}' }),
+  testAccount: (id: string, body: { model?: string; auth_mode?: 'auto' | 'cookie' | 'oauth' } = {}) =>
+    api(`/api/accounts/${encodeURIComponent(id)}/test`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  importAccounts: (rows: Array<Record<string, unknown>>) =>
+    api<{ ok: boolean; imported: number; failed: number; results: any[] }>('/api/accounts/import', {
+      method: 'POST',
+      body: JSON.stringify(rows),
+    }),
+  getModelAliases: () => api<any>('/api/model-aliases'),
+  putModelAliases: (body: Record<string, unknown>) =>
+    api('/api/model-aliases', { method: 'PUT', body: JSON.stringify(body) }),
+
   setHealthy: (id: string, healthy: boolean) =>
     api(`/api/accounts/${encodeURIComponent(id)}`, {
       method: 'PATCH',
@@ -134,6 +169,32 @@ export const adminApi = {
     api(
       `/api/accounts/${encodeURIComponent(id)}/antigravity/oauth/status?session_id=${encodeURIComponent(sessionId)}`,
     ),
+  claudeOAuthExchange: (id: string, body: { session_key: string; org_uuid?: string }) =>
+    api<{
+      ok: boolean
+      message?: string
+      expires_at?: string
+      expires_in?: number
+      credentials?: Record<string, unknown>
+    }>(`/api/accounts/${encodeURIComponent(id)}/claude/oauth/exchange`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  saveClaudeCookie: (id: string, cookie: string) =>
+    api<{ ok: boolean; message?: string; has_cookie?: boolean; identity_verified?: boolean; identity?: Record<string, string>; credentials?: Record<string, unknown> }>(
+      `/api/accounts/${encodeURIComponent(id)}/claude/cookie`,
+      { method: 'PUT', body: JSON.stringify({ cookie }) },
+    ),
+  clearClaudeCookie: (id: string) =>
+    api<{ ok: boolean; message?: string; has_cookie?: boolean; credentials?: Record<string, unknown> }>(
+      `/api/accounts/${encodeURIComponent(id)}/claude/cookie`,
+      { method: 'DELETE' },
+    ),
+  verifyClaudeCookieIdentity: (id: string) =>
+    api<{ ok: boolean; identity_verified: boolean; identity?: Record<string, string>; message?: string }>(
+      `/api/accounts/${encodeURIComponent(id)}/claude/identity`,
+      { method: 'POST', body: '{}' },
+    ),
   patchAccount: (id: string, body: Record<string, unknown>) =>
     api(`/api/accounts/${encodeURIComponent(id)}`, {
       method: 'PATCH',
@@ -150,17 +211,6 @@ export const adminApi = {
     }),
   deleteModelRoute: (id: string) =>
     api(`/api/model-routes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-
-  proxies: () => api<Proxy[] | { items?: Proxy[] }>('/api/proxies'),
-  createProxy: (body: Partial<Proxy>) =>
-    api<Proxy>('/api/proxies', { method: 'POST', body: JSON.stringify(body) }),
-  updateProxy: (id: string, body: Partial<Proxy>) =>
-    api<Proxy>(`/api/proxies/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(body),
-    }),
-  deleteProxy: (id: string) =>
-    api(`/api/proxies/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   channels: () => api<Channel[] | { items?: Channel[] }>('/api/channels'),
   createChannel: (body: Partial<Channel>) =>
@@ -189,12 +239,33 @@ export const adminApi = {
     ),
 
   keys: () => api('/api/keys'),
+  setKeyEnabled: (id: string, enabled: boolean) =>
+    api(`/api/keys/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    }),
+  deleteKey: (id: string) =>
+    api(`/api/keys/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   usage: () => api('/api/usage'),
+  usageSummary: (top = 20) => api(`/api/usage/summary?top=${top}`),
+  models: () => api<any[]>('/api/models'),
+  setModelEnabled: (id: string, enabled: boolean) =>
+    api(`/api/models/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    }),
   tokenRefreshStatus: () => api('/api/token-refresh/status'),
   forceRefreshAccount: (id: string) =>
     api(`/api/accounts/${encodeURIComponent(id)}/refresh`, { method: 'POST', body: '{}' }),
 
   users: () => api<any[]>('/api/users'),
+  createUser: (body: { username: string; password: string; role?: string; quota_total?: number }) =>
+    api('/api/users', { method: 'POST', body: JSON.stringify(body) }),
+  patchUser: (id: string, body: { role?: string; quota_total?: number; note?: string }) =>
+    api(`/api/users/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
   createTopup: (userId: string, body: { credit: number; note?: string }) =>
     api(`/api/users/${encodeURIComponent(userId)}/topups`, {
       method: 'POST',
@@ -233,4 +304,5 @@ export const consoleApi = {
       body: JSON.stringify({ enabled }),
     }),
   usage: () => api('/api/console/usage'),
+  models: () => api<any[]>('/api/console/models'),
 }

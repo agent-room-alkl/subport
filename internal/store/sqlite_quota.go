@@ -31,7 +31,7 @@ var ErrQuotaExhausted = errors.New("quota exhausted")
 // The whole point is that the condition lives INSIDE the UPDATE. Reading the
 // row first and deciding in Go would reintroduce exactly the race being fixed.
 func (s *Store) sqliteReserveQuota(userID string, amount int64) error {
-	res, err := s.db.Exec(
+	res, err := s.exec(
 		`UPDATE users SET quota_reserved = quota_reserved + ?
 		 WHERE id = ? AND (quota_total <= 0 OR quota_used + quota_reserved + ? <= quota_total)`,
 		amount, userID, amount,
@@ -50,7 +50,7 @@ func (s *Store) sqliteReserveQuota(userID string, amount int64) error {
 	// Zero rows means either "would not fit" or "no such user". They are
 	// different bugs and must not be reported as the same one.
 	var exists int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE id=?`, userID).Scan(&exists); err != nil {
+	if err := s.queryRow(`SELECT COUNT(*) FROM users WHERE id=?`, userID).Scan(&exists); err != nil {
 		return err
 	}
 	if exists == 0 {
@@ -63,7 +63,7 @@ func (s *Store) sqliteReserveQuota(userID string, amount int64) error {
 // zero is deliberate: a double release must not manufacture quota out of a
 // negative reservation.
 func (s *Store) sqliteReleaseQuota(userID string, amount int64) error {
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`UPDATE users SET quota_reserved = CASE WHEN quota_reserved > ? THEN quota_reserved - ? ELSE 0 END WHERE id=?`,
 		amount, amount, userID,
 	)
@@ -79,7 +79,7 @@ func (s *Store) sqliteReleaseQuota(userID string, amount int64) error {
 // correctly, because the hold is released in full and the charge is applied in
 // full rather than one being derived from the other.
 func (s *Store) sqliteSettleUsage(l model.UsageLog, reserved int64) error {
-	tx, err := s.db.Begin()
+	tx, err := s.begin()
 	if err != nil {
 		return err
 	}
@@ -90,7 +90,7 @@ func (s *Store) sqliteSettleUsage(l model.UsageLog, reserved int64) error {
 			`tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,`+
 			`rate_input,rate_output,rate_cache_read,rate_cache_write,rate_ratio) `+
 			`VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		l.ID, l.UserID, l.KeyID, l.Model, l.Tokens, l.Cost, l.Status, l.AccountID, l.Attempts, boolInt(l.StreamBroken), boolInt(l.Compensated), l.CreatedAt.Format(time.RFC3339Nano),
+		l.ID, l.UserID, l.KeyID, l.Model, l.Tokens, l.Cost, l.Status, l.AccountID, l.Attempts, s.boolArg(l.StreamBroken), s.boolArg(l.Compensated), l.CreatedAt.Format(time.RFC3339Nano),
 		l.TokenParts.Input, l.TokenParts.Output, l.TokenParts.CacheRead, l.TokenParts.CacheWrite,
 		l.BilledAt.Input, l.BilledAt.Output, l.BilledAt.CacheRead, l.BilledAt.CacheWrite, l.BilledAt.Ratio,
 	); err != nil {

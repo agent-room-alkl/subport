@@ -2,7 +2,7 @@ package gateway
 
 import "testing"
 
-func TestCredentialPresenceForORRuntime(t *testing.T) {
+func TestCredentialPresenceForAccountCacheOnly(t *testing.T) {
 	ClearAccountCredential("acct-presence-test")
 
 	codexCredMu.Lock()
@@ -16,14 +16,15 @@ func TestCredentialPresenceForORRuntime(t *testing.T) {
 		ClearAccountCredential("acct-presence-test")
 	}()
 
+	// Global/runtime credentials must NOT make an empty account row look authorized.
 	codexSetRuntime("rt-access", "rt-refresh", "acc-xyz", 3600)
 
 	p := CredentialPresenceFor("acct-presence-test", "codex")
-	if !p.HasAccessToken || !p.HasRefreshToken {
-		t.Fatalf("runtime presence: %+v", p)
+	if p.HasAccessToken || p.HasRefreshToken {
+		t.Fatalf("empty account must not inherit runtime: %+v", p)
 	}
-	if p.ExpiresAt == "" {
-		t.Fatal("expected runtime expires_at")
+	if HasAccountAccessToken("acct-presence-test") {
+		t.Fatal("HasAccountAccessToken should be false for empty cache")
 	}
 
 	p = CredentialPresenceFor("acct-mock-1", "mock")
@@ -42,5 +43,35 @@ func TestCredentialPresenceForORRuntime(t *testing.T) {
 	}
 	if p.ExpiresAt != "2099-01-01T00:00:00Z" {
 		t.Fatalf("expires_at=%q want DB value", p.ExpiresAt)
+	}
+	if !HasAccountAccessToken("acct-presence-test") {
+		t.Fatal("HasAccountAccessToken should be true when cache has access")
+	}
+}
+
+func TestClaudeCredentialForNoGlobalFallback(t *testing.T) {
+	ClearAccountCredential("acct-iso-claude")
+	defer ClearAccountCredential("acct-iso-claude")
+
+	claudeCredMu.Lock()
+	prev := claudeRuntime
+	claudeRuntime = claudeTokenPair{AccessToken: "neighbor-access", RefreshToken: "neighbor-rt"}
+	claudeCredMu.Unlock()
+	defer func() {
+		claudeCredMu.Lock()
+		claudeRuntime = prev
+		claudeCredMu.Unlock()
+	}()
+
+	if got := claudeCredentialFor("acct-iso-claude"); got != "" {
+		t.Fatalf("non-empty accountID must not fall back to runtime, got %q", got)
+	}
+	SetAccountCredential("acct-iso-claude", "own-access", "own-rt", "", "")
+	if got := claudeCredentialFor("acct-iso-claude"); got != "own-access" {
+		t.Fatalf("want own-access, got %q", got)
+	}
+	// Legacy empty accountID may still use global.
+	if got := claudeCredentialFor(""); got != "neighbor-access" {
+		t.Fatalf("empty accountID legacy path want neighbor-access, got %q", got)
 	}
 }

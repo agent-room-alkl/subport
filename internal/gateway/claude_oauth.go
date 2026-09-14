@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,10 +14,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
 )
 
 const (
@@ -165,7 +167,6 @@ func EnsureClaudeTokensFromEnv() error {
 	log.Printf("claude bootstrap: obtained OAuth access token via sessionKey (expires_in=%ds)", pair.ExpiresIn)
 	return nil
 }
-
 
 func claudeTryRefresh() (bool, error) {
 	rt := claudeRefreshToken()
@@ -367,4 +368,261 @@ func claudeExchangeCode(codeWithState, verifier string) (claudeTokenResponse, er
 		return zero, fmt.Errorf("token exchange: empty access_token")
 	}
 	return tok, nil
+}
+
+// ClaudeOAuthTokenInfo is the public result of a sessionKey exchange.
+// Secrets must never be logged.
+type ClaudeOAuthTokenInfo struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    int64
+	ExpiresAt    string // RFC3339
+}
+
+// ClaudeExchangeError is a classified exchange failure for admin API mapping.
+type ClaudeExchangeError struct {
+	Code           string // session_stale_relogin | subscription_required | authorization_denied | cloudflare | rate_limited | exchange_failed
+	Message        string
+	Step           string // organizations | authorize | token | unknown
+	UpstreamStatus int    // upstream HTTP status when known; 0 if unknown
+}
+
+func (e *ClaudeExchangeError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
+func inferClaudeExchangeStep(msg string) string {
+	low := strings.ToLower(msg)
+	switch {
+	case strings.Contains(low, "organizations"):
+		return "organizations"
+	case strings.Contains(low, "authorize"):
+		return "authorize"
+	case strings.Contains(low, "token"):
+		return "token"
+	default:
+		return "unknown"
+	}
+}
+
+func inferClaudeUpstreamStatus(msg string) int {
+	low := strings.ToLower(msg)
+	for _, key := range []string{"status ", "status="} {
+		if i := strings.Index(low, key); i >= 0 {
+			rest := low[i+len(key):]
+			n := 0
+			for _, ch := range rest {
+				if ch < '0' || ch > '9' {
+					break
+				}
+				n = n*10 + int(ch-'0')
+				if n > 999 {
+					return 0
+				}
+			}
+			if n >= 100 && n <= 599 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func classifyClaudeExchangeErr(err error) *ClaudeExchangeError {
+	if err == nil {
+		return nil
+	}
+	if ce, ok := err.(*ClaudeExchangeError); ok {
+		if ce.Step == "" {
+			ce.Step = inferClaudeExchangeStep(ce.Message)
+		}
+		if ce.UpstreamStatus == 0 {
+			ce.UpstreamStatus = inferClaudeUpstreamStatus(ce.Message)
+		}
+		return ce
+	}
+	msg := err.Error()
+	low := strings.ToLower(msg)
+	code := "exchange_failed"
+	switch {
+	case strings.Contains(low, "just a moment") || strings.Contains(low, "cloudflare") || strings.Contains(low, "cf-mitigated"):
+		code = "cloudflare"
+	case strings.Contains(low, "429") || strings.Contains(low, "rate limited") || strings.Contains(low, "rate_limited"):
+		code = "rate_limited"
+	case strings.Contains(low, "subscription_required") || strings.Contains(low, "pro or max") ||
+		(strings.Contains(low, "requires a pro") && strings.Contains(low, "subscription")):
+		code = "subscription_required"
+	case strings.Contains(low, "authorization_denied") || strings.Contains(low, "permission_error"):
+		code = "authorization_denied"
+	case strings.Contains(low, "401") || strings.Contains(low, "unauthorized") ||
+		strings.Contains(low, "no organizations") || strings.Contains(low, "sessionkey invalid") ||
+		strings.Contains(low, "stale") || strings.Contains(low, "expired"):
+		code = "session_stale_relogin"
+	}
+	return &ClaudeExchangeError{Code: code, Message: msg, Step: inferClaudeExchangeStep(msg), UpstreamStatus: inferClaudeUpstreamStatus(msg)}
+}
+
+func isClaudeCloudflareErr(err error) bool {
+	ce := classifyClaudeExchangeErr(err)
+	return ce != nil && ce.Code == "cloudflare"
+}
+
+// ExchangeClaudeSessionKey exchanges a Claude.ai sessionKey for OAuth tokens.
+// Tries the native Go client first; on Cloudflare blocks, falls back once to the
+// curl_cffi chrome131 helper at scripts/claude_session_exchange.py.
+func ExchangeClaudeSessionKey(sessionKey, orgUUID string) (*ClaudeOAuthTokenInfo, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil, &ClaudeExchangeError{Code: "exchange_failed", Message: "session_key required"}
+	}
+	pair, err := claudeExchangeSession(sessionKey, strings.TrimSpace(orgUUID))
+	if err != nil {
+		if isClaudeCloudflareErr(err) || forceClaudePythonExchange() {
+			log.Printf("claude oauth: native exchange blocked or forced; trying curl_cffi helper")
+			pair, err = claudeExchangeSessionViaPython(sessionKey, strings.TrimSpace(orgUUID))
+		}
+		if err != nil {
+			return nil, classifyClaudeExchangeErr(err)
+		}
+	}
+	info := &ClaudeOAuthTokenInfo{
+		AccessToken:  pair.AccessToken,
+		RefreshToken: pair.RefreshToken,
+		ExpiresIn:    pair.ExpiresIn,
+	}
+	if pair.ExpiresIn > 0 {
+		info.ExpiresAt = time.Now().UTC().Add(time.Duration(pair.ExpiresIn) * time.Second).Format(time.RFC3339)
+	}
+	claudeSetRuntime(pair.AccessToken, pair.RefreshToken, pair.ExpiresIn)
+	return info, nil
+}
+
+func forceClaudePythonExchange() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("SUBPORT_CLAUDE_EXCHANGE_PYTHON")))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+func claudeExchangeSessionViaPython(sessionKey, orgUUID string) (claudeTokenResponse, error) {
+	var zero claudeTokenResponse
+	script, err := findClaudeExchangeScript()
+	if err != nil {
+		return zero, err
+	}
+	py := findPythonExecutable()
+	payload := map[string]string{"session_key": sessionKey}
+	if orgUUID != "" {
+		payload["org_uuid"] = orgUUID
+	}
+	body, _ := json.Marshal(payload)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, py, script)
+	cmd.Stdin = bytes.NewReader(body)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	// Log only non-secret stderr status lines (lengths / status codes).
+	if se := strings.TrimSpace(stderr.String()); se != "" {
+		for _, line := range strings.Split(se, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			low := strings.ToLower(line)
+			if strings.Contains(low, "sk-ant") || strings.Contains(low, "sessionkey") || strings.Contains(low, "access_token") {
+				continue
+			}
+			log.Printf("claude oauth helper: %s", truncate(line, 200))
+		}
+	}
+	raw := strings.TrimSpace(stdout.String())
+	if raw == "" {
+		if runErr != nil {
+			return zero, fmt.Errorf("python helper failed: %w", runErr)
+		}
+		return zero, fmt.Errorf("python helper returned empty output")
+	}
+	var out struct {
+		OK             bool   `json:"ok"`
+		AccessToken    string `json:"access_token"`
+		RefreshToken   string `json:"refresh_token"`
+		ExpiresIn      int64  `json:"expires_in"`
+		Error          string `json:"error"`
+		Code           string `json:"code"`
+		Step           string `json:"step"`
+		UpstreamStatus int    `json:"upstream_status"`
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return zero, fmt.Errorf("python helper bad JSON: %w", err)
+	}
+	if !out.OK || out.AccessToken == "" {
+		code := out.Code
+		if code == "" {
+			code = "exchange_failed"
+		}
+		msg := out.Error
+		if msg == "" {
+			msg = "python helper exchange failed"
+		}
+		step := strings.TrimSpace(out.Step)
+		if step == "" {
+			step = inferClaudeExchangeStep(msg)
+		}
+		ust := out.UpstreamStatus
+		if ust == 0 {
+			ust = inferClaudeUpstreamStatus(msg)
+		}
+		return zero, &ClaudeExchangeError{Code: code, Message: msg, Step: step, UpstreamStatus: ust}
+	}
+	return claudeTokenResponse{
+		AccessToken:  out.AccessToken,
+		RefreshToken: out.RefreshToken,
+		ExpiresIn:    out.ExpiresIn,
+		TokenType:    "Bearer",
+	}, nil
+}
+
+func findClaudeExchangeScript() (string, error) {
+	candidates := []string{}
+	if v := strings.TrimSpace(os.Getenv("SUBPORT_CLAUDE_EXCHANGE_SCRIPT")); v != "" {
+		candidates = append(candidates, v)
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(cwd, "scripts", "claude_session_exchange.py"),
+			filepath.Join(cwd, "claude_session_exchange.py"),
+		)
+	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(dir, "scripts", "claude_session_exchange.py"),
+			filepath.Join(dir, "claude_session_exchange.py"),
+		)
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("claude_session_exchange.py not found (set SUBPORT_CLAUDE_EXCHANGE_SCRIPT)")
+}
+
+func findPythonExecutable() string {
+	if v := strings.TrimSpace(os.Getenv("SUBPORT_PYTHON")); v != "" {
+		return v
+	}
+	for _, name := range []string{"python", "python3", "py"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return "python"
 }

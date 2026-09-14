@@ -151,9 +151,12 @@ func (antigravityProvider) Call(a model.Account, req ChatRequest) (Reply, error)
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
 	key := antigravityCredentialFor(a.ID)
+	if key == "" {
+		return Reply{}, RelayError{Err: fmt.Errorf("account has no credentials"), FirstByteSent: false}
+	}
 	setAntigravityHeaders(httpReq, key)
 
-	resp, err := HTTPClientFor(a).Do(httpReq)
+	resp, err := upstreamClient.Do(httpReq)
 	if err != nil {
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
@@ -161,14 +164,16 @@ func (antigravityProvider) Call(a model.Account, req ChatRequest) (Reply, error)
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		_ = resp.Body.Close()
+		HydrateRuntimeFromAccount(a.ID, "antigravity")
 		if refreshed, rerr := antigravityTryRefresh(); rerr == nil && refreshed {
+			SetAccountCredential(a.ID, antigravityRuntimeAccessToken(), antigravityRefreshToken(), accountExtraJSON(a.ID), antigravityRuntimeExpiresRFC3339())
 			key = antigravityCredentialFor(a.ID)
 			httpReq2, err2 := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 			if err2 != nil {
 				return Reply{}, RelayError{Err: err2, FirstByteSent: false}
 			}
 			setAntigravityHeaders(httpReq2, key)
-			resp2, err2 := HTTPClientFor(a).Do(httpReq2)
+			resp2, err2 := upstreamClient.Do(httpReq2)
 			if err2 != nil {
 				return Reply{}, RelayError{Err: err2, FirstByteSent: false}
 			}

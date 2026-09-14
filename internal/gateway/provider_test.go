@@ -89,6 +89,28 @@ func TestProviderSpecificKeyOverridesShared(t *testing.T) {
 	}
 }
 
+func TestOpenAIAccountCredentialOverridesProviderKey(t *testing.T) {
+	var gotAuth string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer stub.Close()
+
+	const accountID = "acct-openai-isolated"
+	ClearAccountCredential(accountID)
+	defer ClearAccountCredential(accountID)
+	SetAccountCredential(accountID, "account-key", "", "", "")
+	t.Setenv("SUBPORT_PROVIDER_KEY_OPENAI", "shared-provider-key")
+
+	if _, err := CallUpstream(model.Account{ID: accountID, Provider: "openai", BaseURL: stub.URL}, ChatRequest{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuth != "Bearer account-key" {
+		t.Fatalf("Authorization = %q, want account-scoped key", gotAuth)
+	}
+}
+
 // An unknown provider must fail closed. Falling through to the mock would look
 // like it was working while talking to nothing real.
 func TestUnknownProviderFailsClosed(t *testing.T) {

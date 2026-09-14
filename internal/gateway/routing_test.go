@@ -60,6 +60,21 @@ func TestPickFiltersByModelRoutes(t *testing.T) {
 	}
 }
 
+func TestPickDoesNotCrossProviderWhenRoutedAccountUnavailable(t *testing.T) {
+	s := NewScheduler([]model.Account{
+		{ID: "c1", Provider: "claude", Priority: 1, Healthy: false},
+		{ID: "x1", Provider: "codex", Priority: 1, Healthy: true},
+	})
+	s.SetModelRoutes([]model.ModelRoute{
+		{ID: "route-claude", Pattern: "^claude", Provider: "claude", Priority: 1, Enabled: true},
+		{ID: "route-codex", Pattern: "^gpt-|^o[0-9]|^codex", Provider: "codex", Priority: 1, Enabled: true},
+	})
+
+	if got, ok := s.Pick(0, "claude-sonnet-4-5"); ok {
+		t.Fatalf("routed Claude model crossed to unavailable provider: %#v", got)
+	}
+}
+
 func TestAccountCredentialCacheOrder(t *testing.T) {
 	ClearAccountCredential("acct-x")
 	SetAccountCredential("acct-x", "db-token", "db-refresh", `{"chatgpt_account_id":"acc-1"}`, "")

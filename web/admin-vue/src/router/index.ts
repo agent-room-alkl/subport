@@ -6,16 +6,18 @@ import Login from '../views/Login.vue'
 import Overview from '../views/Overview.vue'
 import Accounts from '../views/Accounts.vue'
 import Channels from '../views/Channels.vue'
-import Proxies from '../views/Proxies.vue'
 import Keys from '../views/Keys.vue'
 import Usage from '../views/Usage.vue'
 import Routes from '../views/Routes.vue'
 import Recharge from '../views/Recharge.vue'
+import Users from '../views/Users.vue'
+import Chat from '../views/Chat.vue'
 import ConsoleDashboard from '../views/console/Dashboard.vue'
 import ConsoleRecharge from '../views/console/Recharge.vue'
 import ConsoleKeys from '../views/console/Keys.vue'
 import ConsoleUsage from '../views/console/Usage.vue'
 import ConsoleProfile from '../views/console/Profile.vue'
+import ConsoleModels from '../views/console/Models.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -29,6 +31,7 @@ const router = createRouter({
         { path: 'recharge', name: 'console-recharge', component: ConsoleRecharge },
         { path: 'keys', name: 'console-keys', component: ConsoleKeys },
         { path: 'usage', name: 'console-usage', component: ConsoleUsage },
+        { path: 'models', name: 'console-models', component: ConsoleModels },
         { path: 'profile', name: 'console-profile', component: ConsoleProfile },
       ],
     },
@@ -41,10 +44,11 @@ const router = createRouter({
         { path: 'accounts', name: 'accounts', component: Accounts },
         { path: 'channels', name: 'channels', component: Channels },
         { path: 'routes', name: 'routes', component: Routes },
-        { path: 'proxies', name: 'proxies', component: Proxies },
         { path: 'keys', name: 'keys', component: Keys },
+        { path: 'users', name: 'users', component: Users, meta: { admin: true } },
         { path: 'usage', name: 'usage', component: Usage },
         { path: 'recharge', name: 'recharge', component: Recharge, meta: { admin: true } },
+        { path: 'chat', name: 'chat', component: Chat },
       ],
     },
   ],

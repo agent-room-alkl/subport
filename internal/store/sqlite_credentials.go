@@ -9,15 +9,20 @@ import (
 
 func (s *Store) sqliteGetCredential(accountID string) (model.AccountCredential, error) {
 	var c model.AccountCredential
-	err := s.db.QueryRow(`
+	var updated sqlTimeText
+	err := s.queryRow(`
 SELECT account_id, access_token, refresh_token, extra_json, expires_at, updated_at
 FROM account_credentials WHERE account_id=?`, accountID).Scan(
-		&c.AccountID, &c.AccessToken, &c.RefreshToken, &c.ExtraJSON, &c.ExpiresAt, &c.UpdatedAt,
+		&c.AccountID, &c.AccessToken, &c.RefreshToken, &c.ExtraJSON, &c.ExpiresAt, &updated,
 	)
 	if err == sql.ErrNoRows {
 		return model.AccountCredential{AccountID: accountID}, ErrNotFound
 	}
-	return c, err
+	if err != nil {
+		return c, err
+	}
+	c.UpdatedAt = updated.String()
+	return c, nil
 }
 
 // sqliteUpsertCredential merges fields. Empty access/refresh leave the prior
@@ -43,7 +48,7 @@ func (s *Store) sqliteUpsertCredential(accountID, access, refresh, extraJSON, ex
 		cur.ExpiresAt = expiresAt
 	}
 	cur.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = s.db.Exec(`
+	_, err = s.exec(`
 INSERT INTO account_credentials(account_id, access_token, refresh_token, extra_json, expires_at, updated_at)
 VALUES(?,?,?,?,?,?)
 ON CONFLICT(account_id) DO UPDATE SET
@@ -57,7 +62,7 @@ ON CONFLICT(account_id) DO UPDATE SET
 }
 
 func (s *Store) sqliteDeleteCredential(accountID string) error {
-	res, err := s.db.Exec(`DELETE FROM account_credentials WHERE account_id=?`, accountID)
+	res, err := s.exec(`DELETE FROM account_credentials WHERE account_id=?`, accountID)
 	if err != nil {
 		return err
 	}
@@ -69,7 +74,7 @@ func (s *Store) sqliteDeleteCredential(accountID string) error {
 }
 
 func (s *Store) sqliteListCredentials() ([]model.AccountCredential, error) {
-	rows, err := s.db.Query(`SELECT account_id, access_token, refresh_token, extra_json, expires_at, updated_at FROM account_credentials`)
+	rows, err := s.query(`SELECT account_id, access_token, refresh_token, extra_json, expires_at, updated_at FROM account_credentials`)
 	if err != nil {
 		return nil, err
 	}
@@ -77,9 +82,11 @@ func (s *Store) sqliteListCredentials() ([]model.AccountCredential, error) {
 	var out []model.AccountCredential
 	for rows.Next() {
 		var c model.AccountCredential
-		if err := rows.Scan(&c.AccountID, &c.AccessToken, &c.RefreshToken, &c.ExtraJSON, &c.ExpiresAt, &c.UpdatedAt); err != nil {
+		var updated sqlTimeText
+		if err := rows.Scan(&c.AccountID, &c.AccessToken, &c.RefreshToken, &c.ExtraJSON, &c.ExpiresAt, &updated); err != nil {
 			return nil, err
 		}
+		c.UpdatedAt = updated.String()
 		out = append(out, c)
 	}
 	return out, rows.Err()

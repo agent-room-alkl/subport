@@ -21,6 +21,7 @@ const me = ref<any>(null)
 const keys = ref<any[]>([])
 const topups = ref<any[]>([])
 const usage = ref<UsageRow[]>([])
+const models = ref<{ provider?: string; model?: string; label?: string; notes?: string }[]>([])
 const err = ref('')
 const loading = ref(false)
 
@@ -117,18 +118,20 @@ async function load() {
   loading.value = true
   err.value = ''
   try {
-    const [q, k, t, u, m] = await Promise.all([
+    const [q, k, t, u, m, md] = await Promise.all([
       consoleApi.quota(),
       consoleApi.keys(),
       consoleApi.topups(),
       consoleApi.usage(),
       consoleApi.me().catch(() => null),
+      consoleApi.models().catch(() => []),
     ])
     quota.value = q
     me.value = m
     keys.value = asList(k, ['items', 'rows', 'data', 'keys'])
     topups.value = asList(t, ['items', 'rows', 'data', 'topups'])
     usage.value = asList<UsageRow>(u, ['items', 'rows', 'data', 'results', 'usage'])
+    models.value = asList(md, ['items', 'rows', 'data', 'models']).slice(0, 6)
   } catch (e: any) {
     err.value = e?.message || '加载失败'
   } finally {
@@ -207,6 +210,22 @@ onMounted(load)
               :style="{ width: `${Math.max(4, (m.value / topModelMax) * 100)}%` }"
             />
           </div>
+        </li>
+      </ul>
+    </div>
+
+    <div v-if="models.length" class="card mt-4 space-y-3">
+      <div class="flex items-center justify-between gap-2">
+        <div class="font-semibold">可用模型</div>
+        <button class="btn-ghost text-xs" type="button" @click="router.push({ name: 'console-models' })">全部</button>
+      </div>
+      <ul class="divide-y divide-line text-sm">
+        <li v-for="m in models" :key="m.model" class="flex items-center justify-between gap-2 py-2">
+          <div class="min-w-0">
+            <div class="truncate font-medium">{{ m.label || m.model }}</div>
+            <div class="truncate font-mono text-xs text-slatex">{{ m.model }}</div>
+          </div>
+          <span class="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-xs">{{ m.provider }}</span>
         </li>
       </ul>
     </div>

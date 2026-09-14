@@ -18,12 +18,12 @@ import (
 )
 
 const (
-	codexDefaultBaseURL = "https://chatgpt.com"
-	codexResponsesPath  = "/backend-api/codex/responses"
-	codexDefaultModel   = "gpt-5.5"
-	codexOriginator     = "codex-tui"
-	codexCLIVersion     = "0.146.0"
-	codexCLIUserAgent   = codexOriginator + "/" + codexCLIVersion + " (Windows NT 10.0; Win64) xterm-256color"
+	codexDefaultBaseURL      = "https://chatgpt.com"
+	codexResponsesPath       = "/backend-api/codex/responses"
+	codexDefaultModel        = "gpt-5.5"
+	codexOriginator          = "codex-tui"
+	codexCLIVersion          = "0.153.4"
+	codexCLIUserAgent        = codexOriginator + "/" + codexCLIVersion + " (Windows NT 10.0; Win64) xterm-256color"
 	codexDefaultInstructions = "You are a helpful coding assistant."
 )
 
@@ -46,11 +46,11 @@ type codexInputItem struct {
 }
 
 type codexRequest struct {
-	Model            string           `json:"model"`
-	Instructions     string           `json:"instructions,omitempty"`
-	Input            []codexInputItem `json:"input"`
-	Stream           bool             `json:"stream"`
-	Store            bool             `json:"store"`
+	Model        string           `json:"model"`
+	Instructions string           `json:"instructions,omitempty"`
+	Input        []codexInputItem `json:"input"`
+	Stream       bool             `json:"stream"`
+	Store        bool             `json:"store"`
 }
 
 type codexResponse struct {
@@ -143,12 +143,12 @@ func openAIToCodex(req ChatRequest) (codexRequest, error) {
 	}
 
 	return codexRequest{
-		Model:           modelName,
-		Instructions:    instructions,
-		Input:           inputs,
+		Model:        modelName,
+		Instructions: instructions,
+		Input:        inputs,
 		// ChatGPT Codex OAuth endpoint rejects stream:false ("Stream must be set to true").
-		Stream:          true,
-		Store:           false,
+		Stream: true,
+		Store:  false,
 	}, nil
 }
 
@@ -201,10 +201,13 @@ func (codexProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
 	key := codexCredentialFor(a.ID)
+	if key == "" {
+		return Reply{}, RelayError{Err: fmt.Errorf("account has no credentials"), FirstByteSent: false}
+	}
 	accountID := codexAccountIDFor(a.ID)
 	setCodexHeaders(httpReq, key, accountID)
 
-	resp, err := HTTPClientFor(a).Do(httpReq)
+	resp, err := upstreamClient.Do(httpReq)
 	if err != nil {
 		return Reply{}, RelayError{Err: err, FirstByteSent: false}
 	}
@@ -212,7 +215,9 @@ func (codexProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		_ = resp.Body.Close()
+		HydrateRuntimeFromAccount(a.ID, "codex")
 		if refreshed, rerr := codexTryRefresh(); rerr == nil && refreshed {
+			SetAccountCredential(a.ID, codexRuntimeAccessToken(), codexRefreshToken(), accountExtraJSON(a.ID), codexRuntimeExpiresRFC3339())
 			key = codexCredentialFor(a.ID)
 			accountID = codexAccountIDFor(a.ID)
 			httpReq2, err2 := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
@@ -220,7 +225,7 @@ func (codexProvider) Call(a model.Account, req ChatRequest) (Reply, error) {
 				return Reply{}, RelayError{Err: err2, FirstByteSent: false}
 			}
 			setCodexHeaders(httpReq2, key, accountID)
-			resp2, err2 := HTTPClientFor(a).Do(httpReq2)
+			resp2, err2 := upstreamClient.Do(httpReq2)
 			if err2 != nil {
 				return Reply{}, RelayError{Err: err2, FirstByteSent: false}
 			}
