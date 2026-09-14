@@ -189,12 +189,20 @@ func (s *Server) handleClaudeOAuthExchange(w http.ResponseWriter, r *http.Reques
 		s.Sched.SetAccountHealth(accountID, true)
 	}
 
+	// This mutation response is the only place the newly exchanged secrets are
+	// revealed. Credential reads remain redacted, and intermediaries must not
+	// cache this one-time display payload.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	jsonOut(w, map[string]any{
-		"ok":          true,
-		"message":     "Claude 授权成功",
-		"expires_at":  info.ExpiresAt,
-		"expires_in":  info.ExpiresIn,
-		"credentials": s.Store.PublicCredentialStatus(accountID),
+		"ok":               true,
+		"message":          "Claude 授权成功",
+		"access_token":     info.AccessToken,
+		"refresh_token":    info.RefreshToken,
+		"one_time_display": true,
+		"expires_at":       info.ExpiresAt,
+		"expires_in":       info.ExpiresIn,
+		"credentials":      s.Store.PublicCredentialStatus(accountID),
 	})
 }
 

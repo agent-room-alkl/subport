@@ -173,6 +173,9 @@ export const adminApi = {
     api<{
       ok: boolean
       message?: string
+      access_token?: string
+      refresh_token?: string
+      one_time_display?: boolean
       expires_at?: string
       expires_in?: number
       credentials?: Record<string, unknown>

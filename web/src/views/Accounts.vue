@@ -74,6 +74,8 @@ let oauthPopup: Window | null = null
 const claudeAccount = ref<Account | null>(null)
 const claudeSessionKey = ref('')
 const claudeCookie = ref('')
+const claudeAccessToken = ref('')
+const claudeRefreshToken = ref('')
 const claudeBusy = ref(false)
 const claudeErr = ref('')
 const claudeOk = ref('')
@@ -401,6 +403,8 @@ function closeClaudePanel() {
   claudeAccount.value = null
   claudeSessionKey.value = ''
   claudeCookie.value = ''
+  claudeAccessToken.value = ''
+  claudeRefreshToken.value = ''
   claudeBusy.value = false
   claudeErr.value = ''
   claudeOk.value = ''
@@ -410,6 +414,8 @@ function startClaudeOAuth(a: Account) {
   claudeAccount.value = a
   claudeSessionKey.value = ''
   claudeCookie.value = ''
+  claudeAccessToken.value = ''
+  claudeRefreshToken.value = ''
   claudeErr.value = ''
   claudeOk.value = ''
   msg.value = `手动维护 Claude 授权：${a.id}`
@@ -445,6 +451,8 @@ async function submitClaudeSessionKey() {
   claudeBusy.value = true
   claudeErr.value = ''
   claudeOk.value = ''
+  claudeAccessToken.value = ''
+  claudeRefreshToken.value = ''
   msg.value = `正在保存并交换 Claude 凭证… ${claudeAccount.value.id}`
   let cookieSaved = false
   try {
@@ -454,6 +462,8 @@ async function submitClaudeSessionKey() {
     }
     const out = await adminApi.claudeOAuthExchange(claudeAccount.value.id, { session_key: key })
     claudeOk.value = out.message || 'Claude 授权成功'
+    claudeAccessToken.value = out.access_token || ''
+    claudeRefreshToken.value = out.refresh_token || ''
     msg.value = claudeOk.value
     claudeSessionKey.value = ''
     claudeCookie.value = ''
@@ -468,6 +478,16 @@ async function submitClaudeSessionKey() {
     msg.value = claudeErr.value
   } finally {
     claudeBusy.value = false
+  }
+}
+
+async function copyClaudeToken(value: string, label: string) {
+  if (!value) return
+  try {
+    await navigator.clipboard.writeText(value)
+    msg.value = `${label} 已复制；请妥善保管，不要发到聊天或日志中。`
+  } catch {
+    msg.value = `无法自动复制 ${label}，请从输入框手动选择复制。`
   }
 }
 
@@ -971,6 +991,28 @@ onUnmounted(() => {
       </div>
       <p v-if="claudeErr" class="text-sm text-red-600">{{ claudeErr }}</p>
       <p v-if="claudeOk" class="text-sm text-teal">{{ claudeOk }}</p>
+      <div
+        v-if="claudeAccessToken || claudeRefreshToken"
+        class="space-y-3 rounded-lg border border-amber-200 bg-amber-50 p-3"
+      >
+        <p class="text-xs text-amber-800">
+          以下 Token 仅在本次授权成功后显示；关闭或刷新页面后不会再次回显。
+        </p>
+        <div v-if="claudeAccessToken">
+          <label class="label">Access Token</label>
+          <div class="flex items-start gap-2">
+            <textarea class="input min-h-[72px] flex-1 font-mono text-xs" :value="claudeAccessToken" readonly />
+            <button class="btn-ghost shrink-0" type="button" @click="copyClaudeToken(claudeAccessToken, 'Access Token')">复制</button>
+          </div>
+        </div>
+        <div v-if="claudeRefreshToken">
+          <label class="label">Refresh Token</label>
+          <div class="flex items-start gap-2">
+            <textarea class="input min-h-[72px] flex-1 font-mono text-xs" :value="claudeRefreshToken" readonly />
+            <button class="btn-ghost shrink-0" type="button" @click="copyClaudeToken(claudeRefreshToken, 'Refresh Token')">复制</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div v-if="cookieAccount" class="mt-4 rounded-xl border border-teal/40 bg-white p-4 shadow-sm space-y-3">
