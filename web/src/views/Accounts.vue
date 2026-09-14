@@ -73,6 +73,7 @@ let oauthPopup: Window | null = null
 
 const claudeAccount = ref<Account | null>(null)
 const claudeSessionKey = ref('')
+const claudeCookie = ref('')
 const claudeBusy = ref(false)
 const claudeErr = ref('')
 const claudeOk = ref('')
@@ -399,6 +400,7 @@ async function submitOAuthCallback() {
 function closeClaudePanel() {
   claudeAccount.value = null
   claudeSessionKey.value = ''
+  claudeCookie.value = ''
   claudeBusy.value = false
   claudeErr.value = ''
   claudeOk.value = ''
@@ -407,32 +409,58 @@ function closeClaudePanel() {
 function startClaudeOAuth(a: Account) {
   claudeAccount.value = a
   claudeSessionKey.value = ''
+  claudeCookie.value = ''
   claudeErr.value = ''
   claudeOk.value = ''
-  msg.value = '已打开 claude.ai；授权第二个订阅前请先退出或用无痕窗口登录目标账号，再复制该账号 sessionKey 粘贴到下方。'
-  window.open('https://claude.ai', 'subport-claude-oauth', 'width=980,height=780')
+  msg.value = `手动维护 Claude 授权：${a.id}`
 }
 
 async function submitClaudeSessionKey() {
   if (!claudeAccount.value) return
   const key = claudeSessionKey.value.trim()
+  const cookie = claudeCookie.value.trim()
   if (!key) {
     claudeErr.value = '请粘贴 sessionKey'
     claudeOk.value = ''
     return
   }
+  if (cookie) {
+    const cookieKey = cookie
+      .split(';')
+      .map((part) => part.trim())
+      .find((part) => part.toLowerCase().startsWith('sessionkey='))
+      ?.slice('sessionKey='.length)
+      .trim()
+    if (!cookieKey) {
+      claudeErr.value = '完整 Cookie 中没有找到 sessionKey'
+      claudeOk.value = ''
+      return
+    }
+    if (cookieKey !== key) {
+      claudeErr.value = 'sessionKey 与完整 Cookie 中的 sessionKey 不一致，请确认属于同一个账号'
+      claudeOk.value = ''
+      return
+    }
+  }
   claudeBusy.value = true
   claudeErr.value = ''
   claudeOk.value = ''
-  msg.value = `正在交换 Claude sessionKey… ${claudeAccount.value.id}`
+  msg.value = `正在保存并交换 Claude 凭证… ${claudeAccount.value.id}`
+  let cookieSaved = false
   try {
+    if (cookie) {
+      await adminApi.saveClaudeCookie(claudeAccount.value.id, cookie)
+      cookieSaved = true
+    }
     const out = await adminApi.claudeOAuthExchange(claudeAccount.value.id, { session_key: key })
     claudeOk.value = out.message || 'Claude 授权成功'
     msg.value = claudeOk.value
     claudeSessionKey.value = ''
+    claudeCookie.value = ''
     await load()
   } catch (e: any) {
     const bits = [e.message || 'Claude 授权失败']
+    if (cookieSaved) bits.unshift('Cookie 已保存')
     if (e.step) bits.push(`步骤 ${e.step}`)
     if (e.upstreamStatus) bits.push(`上游 HTTP ${e.upstreamStatus}`)
     if (e.exchangeId) bits.push(`id ${e.exchangeId}`)
@@ -909,15 +937,14 @@ onUnmounted(() => {
         <button class="btn-ghost" type="button" @click="closeClaudePanel">关闭</button>
       </div>
       <p class="text-xs text-slatex">
-        浏览器会打开 <code>https://claude.ai</code>。登录后打开开发者工具 → Application/存储 → Cookies，
-        复制 <code>sessionKey</code> 粘贴到下方并提交；后台会自动交换为 access/refresh token。
+        本页面不会自动打开 claude.ai。请手动粘贴目标账号的 <code>sessionKey</code> 和完整
+        <code>Cookie</code>；提交后会先保存 Cookie，再自动交换 access/refresh token。
       </p>
       <p class="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-        授权第二个订阅前请先退出 claude.ai，或用无痕窗口登录目标账号，再粘贴该账号的 sessionKey。
-        否则浏览器 Cookie 仍是旧账号，会导致串号授权。
+        sessionKey 必须与完整 Cookie 中的 sessionKey 完全一致，否则不会提交，避免串号授权。
       </p>
       <p class="text-xs text-slatex bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
-        Azure 环境建议先为本账号保存完整 Cookie。若其中的 sessionKey 与下方输入一致，交换时会自动携带同账号完整 Cookie，提升通过 Cloudflare 校验的成功率。
+        如果本账号此前已经保存完整 Cookie，可以只粘贴 sessionKey；重新粘贴 Cookie 会覆盖该账号原有 Cookie。
       </p>
       <div>
         <label class="label">sessionKey</label>
@@ -928,12 +955,18 @@ onUnmounted(() => {
           :disabled="claudeBusy"
         />
       </div>
+      <div>
+        <label class="label">完整 Cookie（已保存过可留空）</label>
+        <textarea
+          v-model="claudeCookie"
+          class="input min-h-[100px] font-mono text-xs"
+          placeholder="粘贴完整 Cookie 请求头（不会回显到日志）"
+          :disabled="claudeBusy"
+        />
+      </div>
       <div class="flex flex-wrap items-center gap-2">
         <button class="btn-primary" type="button" :disabled="claudeBusy" @click="submitClaudeSessionKey">
-          {{ claudeBusy ? '交换中…' : '提交并自动交换' }}
-        </button>
-        <button class="btn-ghost" type="button" :disabled="claudeBusy" @click="startClaudeOAuth(claudeAccount!)">
-          重新打开 claude.ai
+          {{ claudeBusy ? '保存并交换中…' : '保存 Cookie 并授权' }}
         </button>
       </div>
       <p v-if="claudeErr" class="text-sm text-red-600">{{ claudeErr }}</p>
