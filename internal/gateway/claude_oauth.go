@@ -381,7 +381,7 @@ type ClaudeOAuthTokenInfo struct {
 
 // ClaudeExchangeError is a classified exchange failure for admin API mapping.
 type ClaudeExchangeError struct {
-	Code           string // session_stale_relogin | subscription_required | authorization_denied | cloudflare | rate_limited | exchange_failed
+	Code           string // session_stale_relogin | subscription_required | authorization_denied | cloudflare | rate_limited | helper_unavailable | exchange_failed
 	Message        string
 	Step           string // organizations | authorize | token | unknown
 	UpstreamStatus int    // upstream HTTP status when known; 0 if unknown
@@ -451,6 +451,11 @@ func classifyClaudeExchangeErr(err error) *ClaudeExchangeError {
 	low := strings.ToLower(msg)
 	code := "exchange_failed"
 	switch {
+	case strings.Contains(low, "claude_session_exchange.py not found") ||
+		strings.Contains(low, "executable file not found") ||
+		strings.Contains(low, "no module named 'curl_cffi'") ||
+		strings.Contains(low, "no module named curl_cffi"):
+		code = "helper_unavailable"
 	case strings.Contains(low, "just a moment") || strings.Contains(low, "cloudflare") || strings.Contains(low, "cf-mitigated"):
 		code = "cloudflare"
 	case strings.Contains(low, "429") || strings.Contains(low, "rate limited") || strings.Contains(low, "rate_limited"):

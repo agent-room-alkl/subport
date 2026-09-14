@@ -59,6 +59,8 @@ func claudeExchangeFailMessage(code string, upstreamStatus int) string {
 		return "Cloudflare 拦截了交换请求，请稍后重试"
 	case "rate_limited":
 		return "上游限流 (429)，请稍后重试"
+	case "helper_unavailable":
+		return "服务器缺少 Claude OAuth 交换组件（Python/curl_cffi/交换脚本），请重新发布完整镜像"
 	default:
 		return "Claude 授权交换失败"
 	}
