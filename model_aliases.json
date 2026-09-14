@@ -1,0 +1,12 @@
+{
+  "aliases": {
+    "sonnet": "claude-sonnet-4-5-20250929",
+    "haiku": "claude-haiku-4-5-20251001",
+    "opus": "claude-opus-4-1-20250805"
+  },
+  "fallbacks": {
+    "claude-sonnet-4-5-20250929": ["claude-haiku-4-5-20251001"],
+    "claude-opus-4-1-20250805": ["claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"]
+  },
+  "max_fallback_tries": 2
+}

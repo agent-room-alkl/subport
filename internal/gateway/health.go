@@ -13,13 +13,13 @@ import (
 // Failure class thresholds. Hitting a threshold marks the account unhealthy
 // and sets CooldownUntil (temp-unsched via existing fields).
 const (
-	TimeoutPauseThreshold = 3
+	TimeoutPauseThreshold   = 3
 	ForbiddenPauseThreshold = 2
 	RateLimitPauseThreshold = 3
 
 	TimeoutCooldown   = 5 * time.Minute
 	ForbiddenCooldown = 15 * time.Minute
-	RateLimitCooldown = 2 * time.Minute
+	RateLimitCooldown = 60 * time.Second // NeoLab-style soft rotate default
 )
 
 // FailureClass categorises upstream errors for auto-pause counters.
@@ -52,7 +52,9 @@ func ClassifyUpstreamError(err error) FailureClass {
 	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "i/o timeout") {
 		return FailureTimeout
 	}
-	if strings.Contains(msg, "status 429") || strings.Contains(msg, "rate limit") || strings.Contains(msg, "rate_limit") || strings.Contains(msg, "too many requests") {
+	if strings.Contains(msg, "status 429") || strings.Contains(msg, "rate limit") || strings.Contains(msg, "rate_limit") ||
+		strings.Contains(msg, "too many requests") || strings.Contains(msg, "exceeded_limit") ||
+		strings.Contains(msg, "out_of_credits") {
 		return FailureRateLimit
 	}
 	if strings.Contains(msg, "status 403") || strings.Contains(msg, "forbidden") {
@@ -86,6 +88,7 @@ func (s *Scheduler) NoteUpstreamResult(accountID string, callErr error) {
 		a.Consecutive403 = 0
 		a.Consecutive429 = 0
 		a.LastError = ""
+		a.CooldownUntil = ""
 		s.persistHealthLocked(*a)
 		return
 	}
@@ -114,15 +117,33 @@ func (s *Scheduler) NoteUpstreamResult(accountID string, callErr error) {
 		}
 	case FailureRateLimit:
 		a.Consecutive429++
+		// NeoLab-style: soft-cooldown immediately on every 429 (default 60s
+		// or resetsAt). Account stays Healthy=true so Pick skips via
+		// CooldownUntil; hard-pause only after repeated hits.
+		now := time.Now().UTC()
+		cd := CooldownDurationForError(callErr, now)
+		if cd <= 0 {
+			cd = RateLimitCooldown
+		}
+		a.CooldownUntil = now.Add(cd).Format(time.RFC3339)
+		log.Printf("cooldown: account=%s class=429 consecutive_429=%d cooldown_until=%s",
+			a.ID, a.Consecutive429, a.CooldownUntil)
 		if a.Consecutive429 >= RateLimitPauseThreshold {
 			paused = true
-			cooldown = RateLimitCooldown
+			cooldown = cd
+			if cooldown < RateLimitCooldown {
+				cooldown = RateLimitCooldown
+			}
 		}
+	default:
+		// other classes handled above; no extra action
 	}
 
 	if paused {
 		a.Healthy = false
-		a.CooldownUntil = time.Now().UTC().Add(cooldown).Format(time.RFC3339)
+		if a.CooldownUntil == "" {
+			a.CooldownUntil = time.Now().UTC().Add(cooldown).Format(time.RFC3339)
+		}
 		log.Printf("auto-pause: account=%s class=%s timeouts=%d 403=%d 429=%d cooldown_until=%s",
 			a.ID, class, a.ConsecutiveTimeouts, a.Consecutive403, a.Consecutive429, a.CooldownUntil)
 	}

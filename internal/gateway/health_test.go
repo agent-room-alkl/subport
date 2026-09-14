@@ -71,3 +71,39 @@ func TestPickSkipsCooldown(t *testing.T) {
 		t.Fatalf("Pick got %#v ok=%v want a2", got, ok)
 	}
 }
+
+func TestImmediateCooldownOn429(t *testing.T) {
+	s := NewScheduler([]model.Account{{
+		ID: "a1", Provider: "mock", Priority: 1, Healthy: true,
+	}})
+	s.NoteUpstreamResult("a1", fmt.Errorf("upstream status 429: rate_limit"))
+	accts := s.Accounts()
+	if accts[0].CooldownUntil == "" {
+		t.Fatal("expected soft cooldown_until on first 429")
+	}
+	if accts[0].Consecutive429 != 1 {
+		t.Fatalf("consecutive_429=%d", accts[0].Consecutive429)
+	}
+	if !accts[0].Healthy {
+		t.Fatal("soft cooldown should keep Healthy=true before threshold")
+	}
+	// success clears
+	s.NoteUpstreamResult("a1", nil)
+	accts = s.Accounts()
+	if accts[0].Consecutive429 != 0 || accts[0].CooldownUntil != "" {
+		t.Fatalf("success should clear 429+cooldown: %+v", accts[0])
+	}
+}
+
+func TestPickSoonestCooldownWhenAllCooling(t *testing.T) {
+	soon := time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339)
+	later := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339)
+	s := NewScheduler([]model.Account{
+		{ID: "late", Provider: "mock", Priority: 1, Healthy: true, CooldownUntil: later},
+		{ID: "soon", Provider: "mock", Priority: 1, Healthy: true, CooldownUntil: soon},
+	})
+	got, ok := s.Pick(0, "gpt-4o-mini")
+	if !ok || got.ID != "soon" {
+		t.Fatalf("Pick got %#v ok=%v want soon", got, ok)
+	}
+}

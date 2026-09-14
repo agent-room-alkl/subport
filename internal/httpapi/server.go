@@ -1,4 +1,4 @@
-﻿// Package httpapi wires the routes and enforces the access boundary.
+// Package httpapi wires the routes and enforces the access boundary.
 //
 // The boundary in one sentence: a /api/console/* handler NEVER reads a user id
 // from the request, only from the authenticated session. "Read someone else's
@@ -7,7 +7,10 @@
 package httpapi
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -274,12 +277,88 @@ func asRelay(err error, target *gateway.RelayError) bool {
 	return ok
 }
 
+// genAccountID builds acct-{provider}-{short} when the client omits id.
+func genAccountID(provider string) string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	short := hex.EncodeToString(b)
+	p := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return '-'
+	}, strings.ToLower(strings.TrimSpace(provider)))
+	p = strings.Trim(p, "-")
+	if p == "" {
+		p = "unknown"
+	}
+	return fmt.Sprintf("acct-%s-%s", p, short)
+}
+
 func (s *Server) adminRoutes(w http.ResponseWriter, r *http.Request, rest string) {
 	if s.adminRechargeRoutes(w, r, rest) {
 		return
 	}
 	switch {
 	// --- accounts ---
+	case rest == "accounts" && r.Method == http.MethodPost:
+		var in struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			Label    string `json:"label"`
+			Provider string `json:"provider"`
+			BaseURL  string `json:"base_url"`
+			Priority *int   `json:"priority"`
+			Healthy  *bool  `json:"healthy"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(w, http.StatusBadRequest, "bad request")
+			return
+		}
+		provider := strings.ToLower(strings.TrimSpace(in.Provider))
+		if provider == "" {
+			fail(w, http.StatusBadRequest, "provider is required")
+			return
+		}
+		name := strings.TrimSpace(in.Name)
+		if name == "" {
+			name = strings.TrimSpace(in.Label)
+		}
+		if name == "" {
+			fail(w, http.StatusBadRequest, "name or label is required")
+			return
+		}
+		id := strings.TrimSpace(in.ID)
+		if id == "" {
+			id = genAccountID(provider)
+		}
+		priority := 1
+		if in.Priority != nil {
+			priority = *in.Priority
+		}
+		healthy := true
+		if in.Healthy != nil {
+			healthy = *in.Healthy
+		}
+		a := model.Account{
+			ID:       id,
+			Name:     name,
+			Provider: provider,
+			BaseURL:  strings.TrimSpace(in.BaseURL),
+			Priority: priority,
+			Healthy:  healthy,
+		}
+		if err := s.Store.UpsertAccount(a); err != nil {
+			fail(w, http.StatusInternalServerError, "could not save account")
+			return
+		}
+		s.Sched.ReplaceAccounts(s.Store.Accounts())
+		creds, _ := s.Store.GetCredential(a.ID)
+		pub := model.PublicAccount(a, creds)
+		applyRuntimeCredentialPresence(pub, a)
+		w.WriteHeader(http.StatusCreated)
+		jsonOut(w, pub)
+
 	case rest == "accounts" && r.Method == http.MethodGet:
 		creds, _ := s.Store.ListCredentialsForBootstrap()
 		byID := make(map[string]model.AccountCredential, len(creds))
@@ -295,24 +374,72 @@ func (s *Server) adminRoutes(w http.ResponseWriter, r *http.Request, rest string
 		jsonOut(w, out)
 
 	case strings.HasPrefix(rest, "accounts/") && r.Method == http.MethodPatch:
-		// Admin toggles an account's health. Updates both the store
-		// (authoritative persistence) and the scheduler (in-memory copy
-		// that Pick() reads). Used to drive the compensation proof: set
-		// every account except acct-stream-break to unhealthy so every
-		// call produces a stream_broken log.
-		var in struct {
-			Healthy *bool `json:"healthy"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Healthy == nil {
-			fail(w, http.StatusBadRequest, "healthy is required")
-			return
-		}
+		// Partial update: healthy, name/label, priority, base_url.
+		// Persists to store and refreshes the scheduler in-memory list.
 		id := strings.TrimPrefix(rest, "accounts/")
-		if err := s.Store.SetAccountHealthy(id, *in.Healthy); err != nil {
+		if id == "" || strings.Contains(id, "/") {
 			fail(w, http.StatusNotFound, "account not found")
 			return
 		}
-		s.Sched.SetAccountHealth(id, *in.Healthy)
+		var in struct {
+			Healthy  *bool   `json:"healthy"`
+			Name     *string `json:"name"`
+			Label    *string `json:"label"`
+			Priority *int    `json:"priority"`
+			BaseURL  *string `json:"base_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(w, http.StatusBadRequest, "bad request")
+			return
+		}
+		if in.Healthy == nil && in.Name == nil && in.Label == nil && in.Priority == nil && in.BaseURL == nil {
+			fail(w, http.StatusBadRequest, "no fields to update")
+			return
+		}
+		cur, err := s.Store.AccountByID(id)
+		if err != nil {
+			fail(w, http.StatusNotFound, "account not found")
+			return
+		}
+		if in.Healthy != nil {
+			cur.Healthy = *in.Healthy
+			if *in.Healthy {
+				cur.CooldownUntil = ""
+			}
+		}
+		if in.Name != nil {
+			cur.Name = strings.TrimSpace(*in.Name)
+		} else if in.Label != nil {
+			cur.Name = strings.TrimSpace(*in.Label)
+		}
+		if in.Priority != nil {
+			cur.Priority = *in.Priority
+		}
+		if in.BaseURL != nil {
+			cur.BaseURL = strings.TrimSpace(*in.BaseURL)
+		}
+		if err := s.Store.UpsertAccount(cur); err != nil {
+			fail(w, http.StatusInternalServerError, "could not update account")
+			return
+		}
+		s.Sched.ReplaceAccounts(s.Store.Accounts())
+		w.WriteHeader(http.StatusNoContent)
+
+	case strings.HasPrefix(rest, "accounts/") && r.Method == http.MethodDelete:
+		id := strings.TrimPrefix(rest, "accounts/")
+		if id == "" || strings.Contains(id, "/") {
+			// Nested paths (e.g. accounts/{id}/claude/cookie) belong to adminExtRoutes.
+			if s.adminExtRoutes(w, r, rest) {
+				return
+			}
+			fail(w, http.StatusNotFound, "account not found")
+			return
+		}
+		if err := s.Store.DeleteAccount(id); err != nil {
+			fail(w, http.StatusNotFound, "account not found")
+			return
+		}
+		s.Sched.ReplaceAccounts(s.Store.Accounts())
 		w.WriteHeader(http.StatusNoContent)
 
 	// --- compensations (admin view) ---
@@ -371,21 +498,79 @@ func (s *Server) adminRoutes(w http.ResponseWriter, r *http.Request, rest string
 			"accounts_total":   len(accounts),
 			"accounts_healthy": healthy,
 			"channels_total":   len(s.Store.ListChannels()),
-			"proxies_total":    len(s.Store.ListProxies()),
 			"keys_total":       len(s.Store.ListAllKeys()),
 			"requests_24h":     s.Store.CountUsageSince(since),
+			"usage_by_day":     s.Store.UsageByDay(7),
+			"usage_by_model":   s.Store.UsageByModel(10),
+			"users_total":      s.Store.CountUsers(),
+			"admins_total":     s.Store.CountAdmins(),
 		})
 
 	case rest == "keys" && r.Method == http.MethodGet:
 		out := []map[string]any{}
 		for _, k := range s.Store.ListAllKeys() {
+			username := ""
+			if u, err := s.Store.UserByID(k.UserID); err == nil {
+				username = u.Username
+			}
 			out = append(out, map[string]any{
 				"id": k.ID, "name": k.Name, "prefix": k.Prefix,
 				"enabled": k.Enabled, "created_at": k.CreatedAt,
 				"last_used_at": k.LastUsed, "user_id": k.UserID,
+				"username": username,
 			})
 		}
 		jsonOut(w, out)
+
+	case strings.HasPrefix(rest, "keys/") && r.Method == http.MethodPatch:
+		id := strings.TrimPrefix(rest, "keys/")
+		if strings.Contains(id, "/") {
+			fail(w, http.StatusNotFound, "no such admin endpoint")
+			return
+		}
+		var in struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Enabled == nil {
+			fail(w, http.StatusBadRequest, "enabled is required")
+			return
+		}
+		if err := s.Store.AdminSetKeyEnabled(id, *in.Enabled); err != nil {
+			fail(w, http.StatusNotFound, "key not found")
+			return
+		}
+		k, _ := s.Store.KeyByIDOnly(id)
+		username := ""
+		if u, err := s.Store.UserByID(k.UserID); err == nil {
+			username = u.Username
+		}
+		jsonOut(w, map[string]any{
+			"id": k.ID, "name": k.Name, "prefix": k.Prefix,
+			"enabled": k.Enabled, "created_at": k.CreatedAt,
+			"last_used_at": k.LastUsed, "user_id": k.UserID,
+			"username": username,
+		})
+
+	case strings.HasPrefix(rest, "keys/") && r.Method == http.MethodDelete:
+		id := strings.TrimPrefix(rest, "keys/")
+		if strings.Contains(id, "/") {
+			fail(w, http.StatusNotFound, "no such admin endpoint")
+			return
+		}
+		if err := s.Store.AdminDeleteKey(id); err != nil {
+			fail(w, http.StatusNotFound, "key not found")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	case rest == "usage/summary" && r.Method == http.MethodGet:
+		topN := 20
+		if q := r.URL.Query().Get("top"); q != "" {
+			if n, err := strconv.Atoi(q); err == nil && n > 0 {
+				topN = n
+			}
+		}
+		jsonOut(w, s.Store.UsageSummary(topN))
 
 	case rest == "usage" && r.Method == http.MethodGet:
 		limit := 100
@@ -397,8 +582,17 @@ func (s *Server) adminRoutes(w http.ResponseWriter, r *http.Request, rest string
 		logs := s.Store.UsageRecent(limit)
 		out := make([]map[string]any, 0, len(logs))
 		for _, l := range logs {
+			username := ""
+			if u, err := s.Store.UserByID(l.UserID); err == nil {
+				username = u.Username
+			}
+			keyPrefix := ""
+			if k, err := s.Store.KeyByIDOnly(l.KeyID); err == nil {
+				keyPrefix = k.Prefix
+			}
 			out = append(out, map[string]any{
-				"id": l.ID, "user_id": l.UserID, "key_id": l.KeyID,
+				"id": l.ID, "user_id": l.UserID, "username": username,
+				"key_id": l.KeyID, "key_prefix": keyPrefix,
 				"model": l.Model, "tokens": l.Tokens, "cost": l.Cost,
 				"status": l.Status, "account_id": l.AccountID,
 				"attempts": l.Attempts, "stream_broken": l.StreamBroken,
@@ -406,6 +600,34 @@ func (s *Server) adminRoutes(w http.ResponseWriter, r *http.Request, rest string
 			})
 		}
 		jsonOut(w, out)
+
+	case rest == "models" && r.Method == http.MethodGet:
+		jsonOut(w, s.Store.ListAvailableModels())
+
+	case strings.HasPrefix(rest, "models/") && r.Method == http.MethodPatch:
+		id := strings.TrimPrefix(rest, "models/")
+		if strings.Contains(id, "/") || id == "" {
+			fail(w, http.StatusNotFound, "no such admin endpoint")
+			return
+		}
+		var in struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Enabled == nil {
+			fail(w, http.StatusBadRequest, "enabled is required")
+			return
+		}
+		if err := s.Store.SetAvailableModelEnabled(id, *in.Enabled); err != nil {
+			fail(w, http.StatusNotFound, "model not found")
+			return
+		}
+		for _, m := range s.Store.ListAvailableModels() {
+			if m.ID == id {
+				jsonOut(w, m)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
 
 	default:
 		if s.adminExtRoutes(w, r, rest) {

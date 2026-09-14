@@ -1,7 +1,9 @@
 package store_test
 
 import (
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/agent-room-alkl/subport/internal/model"
@@ -117,21 +119,13 @@ func TestCredentialRoundtrip(t *testing.T) {
 	}
 }
 
-func TestProxiesChannelsCRUD(t *testing.T) {
+func TestChannelsCRUD(t *testing.T) {
 	dir := t.TempDir()
 	s, err := store.OpenStore(filepath.Join(dir, "crud.json"), "http://127.0.0.1:9")
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
 	defer s.Close()
-
-	p := model.Proxy{ID: "proxy-1", Name: "US", Type: "http", URL: "http://127.0.0.1:8888", Enabled: true}
-	if err := s.UpsertProxy(p); err != nil {
-		t.Fatalf("UpsertProxy: %v", err)
-	}
-	if len(s.ListProxies()) != 1 {
-		t.Fatal("expected 1 proxy")
-	}
 
 	ch := model.Channel{ID: "chan-1", Name: "Claude pool", Provider: "claude", ModelsJSON: `["claude-sonnet-4-5"]`, Enabled: true, Priority: 1}
 	if err := s.UpsertChannel(ch); err != nil {
@@ -143,4 +137,88 @@ func TestProxiesChannelsCRUD(t *testing.T) {
 	if len(s.ListChannelAccounts("chan-1")) != 1 {
 		t.Fatal("expected 1 mapping")
 	}
+}
+
+func TestAccountCookieRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.OpenStore(filepath.Join(dir, "cookie.json"), "http://127.0.0.1:9")
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer s.Close()
+
+	acct := model.Account{
+		ID: "acct-cookie-1", Name: "Cookie Claude", Provider: "claude",
+		BaseURL: "https://api.anthropic.com", Priority: 1, Healthy: true,
+	}
+	if err := s.UpsertAccount(acct); err != nil {
+		t.Fatalf("UpsertAccount: %v", err)
+	}
+
+	// Preserve unrelated extra fields when setting cookie.
+	extra := `{"chatgpt_account_id":"acct_keep","project_id":"proj_keep"}`
+	if _, err := s.UpsertCredential(acct.ID, store.CredentialPatch{ExtraJSON: &extra}); err != nil {
+		t.Fatalf("seed extra: %v", err)
+	}
+
+	fake := "sessionKey=sk-ant-sid01-FAKE; other=1"
+	if _, err := s.SetAccountCookie(acct.ID, "  "+fake+"  "); err != nil {
+		t.Fatalf("SetAccountCookie: %v", err)
+	}
+	if !s.HasAccountCookie(acct.ID) {
+		t.Fatal("expected HasAccountCookie true")
+	}
+	got, err := s.GetAccountCookie(acct.ID)
+	if err != nil || got != fake {
+		t.Fatalf("GetAccountCookie: got %q err=%v", got, err)
+	}
+
+	pub := s.PublicCredentialStatus(acct.ID)
+	if pub["has_cookie"] != true {
+		t.Fatalf("has_cookie: %#v", pub)
+	}
+	blob, _ := json.Marshal(pub)
+	if strings.Contains(string(blob), "sk-ant-sid01-FAKE") || strings.Contains(string(blob), "sessionKey=") {
+		t.Fatalf("public status leaked cookie: %s", blob)
+	}
+	extraOut, _ := pub["extra"].(map[string]any)
+	if _, ok := extraOut["cookie"]; ok {
+		t.Fatal("extra must not include cookie key")
+	}
+	if extraOut["chatgpt_account_id"] != "acct_keep" {
+		t.Fatalf("chatgpt_account_id lost: %#v", extraOut)
+	}
+
+	pa := model.PublicAccount(acct, mustCred(t, s, acct.ID))
+	if pa["has_cookie"] != true {
+		t.Fatalf("PublicAccount has_cookie: %#v", pa)
+	}
+	pblob, _ := json.Marshal(pa)
+	if strings.Contains(string(pblob), "sk-ant-sid01-FAKE") {
+		t.Fatalf("PublicAccount leaked cookie: %s", pblob)
+	}
+
+	if _, err := s.ClearAccountCookie(acct.ID); err != nil {
+		t.Fatalf("ClearAccountCookie: %v", err)
+	}
+	if s.HasAccountCookie(acct.ID) {
+		t.Fatal("expected HasAccountCookie false after clear")
+	}
+	pub2 := s.PublicCredentialStatus(acct.ID)
+	if pub2["has_cookie"] != false {
+		t.Fatalf("has_cookie after clear: %#v", pub2)
+	}
+	extra2, _ := pub2["extra"].(map[string]any)
+	if extra2["chatgpt_account_id"] != "acct_keep" {
+		t.Fatalf("chatgpt_account_id lost after clear: %#v", extra2)
+	}
+}
+
+func mustCred(t *testing.T, s *store.Store, id string) model.AccountCredential {
+	t.Helper()
+	c, err := s.GetCredential(id)
+	if err != nil {
+		t.Fatalf("GetCredential: %v", err)
+	}
+	return c
 }

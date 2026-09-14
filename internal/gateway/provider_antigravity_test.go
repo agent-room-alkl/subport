@@ -30,19 +30,10 @@ func TestAntigravityAcceptsModel(t *testing.T) {
 }
 
 func TestAntigravityCallAggregatesSSE(t *testing.T) {
-	antigravityCredMu.Lock()
-	prev := antigravityRuntime
-	antigravityRuntime = antigravityTokenPair{
-		AccessToken:  "test-access",
-		RefreshToken: "test-refresh",
-		ProjectID:    "proj-123",
-	}
-	antigravityCredMu.Unlock()
-	defer func() {
-		antigravityCredMu.Lock()
-		antigravityRuntime = prev
-		antigravityCredMu.Unlock()
-	}()
+	ClearAccountCredential("acct-antigravity-1")
+	extra, _ := json.Marshal(map[string]string{"project_id": "proj-123"})
+	SetAccountCredential("acct-antigravity-1", "test-access", "test-refresh", string(extra), "")
+	defer ClearAccountCredential("acct-antigravity-1")
 
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer test-access" {

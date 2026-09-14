@@ -225,8 +225,10 @@ func antigravityCredential() string {
 }
 
 func antigravityCredentialFor(accountID string) string {
-	if v := accountAccessToken(accountID); v != "" {
-		return v
+	// Per-account isolation: non-empty accountID uses only that account's cache.
+	accountID = trimSpace(accountID)
+	if accountID != "" {
+		return accountAccessToken(accountID)
 	}
 	return antigravityCredential()
 }

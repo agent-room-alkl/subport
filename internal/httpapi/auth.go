@@ -204,6 +204,9 @@ func (s *Server) consoleRoutes(w http.ResponseWriter, r *http.Request, rest stri
 	case rest == "usage" && r.Method == http.MethodGet:
 		jsonOut(w, s.Store.UsageOf(me.ID, 100))
 
+	case rest == "models" && r.Method == http.MethodGet:
+		jsonOut(w, s.Store.ListEnabledAvailableModels())
+
 	default:
 		fail(w, http.StatusNotFound, "no such console endpoint")
 	}

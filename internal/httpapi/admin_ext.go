@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -11,10 +12,47 @@ import (
 	"github.com/agent-room-alkl/subport/internal/store"
 )
 
-// adminRoutesExtended handles credentials, proxies, channels, routes, and
+// adminRoutesExtended handles credentials, channels, routes, and
 // account connectivity tests. Called from adminRoutes after the legacy cases.
 func (s *Server) adminExtRoutes(w http.ResponseWriter, r *http.Request, rest string) bool {
 	switch {
+	case rest == "accounts/import" && r.Method == http.MethodPost:
+		s.handleAccountsImport(w, r)
+		return true
+
+	case rest == "model-aliases" && r.Method == http.MethodGet:
+		cfg := gateway.GetModelAliasConfig()
+		jsonOut(w, map[string]any{
+			"aliases":            cfg.Aliases,
+			"fallbacks":          cfg.Fallbacks,
+			"max_fallback_tries": cfg.MaxFallbackTries,
+			"stored":             s.Store.GetModelAliasesJSON(),
+		})
+		return true
+
+	case rest == "model-aliases" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
+		var cfg gateway.ModelAliasConfig
+		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+			fail(w, http.StatusBadRequest, "bad request")
+			return true
+		}
+		// Normalize a copy first, persist it, and only then publish it to the
+		// live process. A failed database write must not return 200 or create a
+		// configuration that disappears on restart.
+		normalized := gateway.NormalizeModelAliasConfig(cfg)
+		b, err := json.Marshal(normalized)
+		if err != nil {
+			fail(w, http.StatusBadRequest, "invalid model alias config")
+			return true
+		}
+		if err := s.Store.SetModelAliasesJSON(string(b)); err != nil {
+			fail(w, http.StatusInternalServerError, "could not save model alias config")
+			return true
+		}
+		gateway.SetModelAliasConfig(normalized)
+		jsonOut(w, normalized)
+		return true
+
 	case rest == "token-refresh/status" && r.Method == http.MethodGet:
 		jsonOut(w, gateway.GetTokenRefreshStatus())
 		return true
@@ -34,6 +72,30 @@ func (s *Server) adminExtRoutes(w http.ResponseWriter, r *http.Request, rest str
 	case strings.HasPrefix(rest, "accounts/") && strings.Contains(rest, "/antigravity/oauth/status") && r.Method == http.MethodGet:
 		if id, ok := parseAccountAntigravityOAuthPath(rest, "status"); ok {
 			s.handleAntigravityOAuthStatus(w, r, id)
+			return true
+		}
+
+	case strings.HasPrefix(rest, "accounts/") && strings.Contains(rest, "/claude/oauth/exchange") && r.Method == http.MethodPost:
+		if id, ok := parseAccountClaudeOAuthPath(rest, "exchange"); ok {
+			s.handleClaudeOAuthExchange(w, r, id)
+			return true
+		}
+
+	case strings.HasPrefix(rest, "accounts/") && strings.HasSuffix(rest, "/claude/cookie") && (r.Method == http.MethodPut || r.Method == http.MethodPost):
+		if id, ok := parseAccountClaudeCookiePath(rest); ok {
+			s.handleClaudeCookieSave(w, r, id)
+			return true
+		}
+
+	case strings.HasPrefix(rest, "accounts/") && strings.HasSuffix(rest, "/claude/cookie") && r.Method == http.MethodDelete:
+		if id, ok := parseAccountClaudeCookiePath(rest); ok {
+			s.handleClaudeCookieClear(w, r, id)
+			return true
+		}
+
+	case strings.HasPrefix(rest, "accounts/") && strings.HasSuffix(rest, "/claude/identity") && r.Method == http.MethodPost:
+		if id, ok := parseAccountClaudeIdentityPath(rest); ok {
+			s.handleClaudeCookieIdentity(w, r, id)
 			return true
 		}
 
@@ -160,59 +222,18 @@ func (s *Server) adminExtRoutes(w http.ResponseWriter, r *http.Request, rest str
 			gateway.SetAccountCredential(id, cred.AccessToken, cred.RefreshToken, cred.ExtraJSON, cred.ExpiresAt)
 			gateway.HydrateRuntimeFromAccount(id, acct.Provider)
 		}
-		result := s.smokeTestAccount(acct)
+		var input struct {
+			Model    string `json:"model"`
+			AuthMode string `json:"auth_mode"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(r.Body).Decode(&input); err != nil && err != io.EOF {
+				fail(w, http.StatusBadRequest, "bad request")
+				return true
+			}
+		}
+		result := s.smokeTestAccount(acct, input.Model, input.AuthMode)
 		jsonOut(w, result)
-		return true
-
-	// --- proxies CRUD ---
-	case rest == "proxies" && r.Method == http.MethodGet:
-		jsonOut(w, s.Store.ListProxies())
-		return true
-	case rest == "proxies" && r.Method == http.MethodPost:
-		var p model.Proxy
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-			fail(w, http.StatusBadRequest, "bad request")
-			return true
-		}
-		p.Enabled = true
-		if err := s.Store.UpsertProxy(p); err != nil {
-			fail(w, http.StatusInternalServerError, "could not save proxy")
-			return true
-		}
-		if p.Enabled {
-			gateway.SetProxyURL(p.ID, gateway.NormalizeProxyURL(p.Type, p.URL))
-		} else {
-			gateway.ClearProxyURL(p.ID)
-		}
-		jsonOut(w, p)
-		return true
-	case strings.HasPrefix(rest, "proxies/") && r.Method == http.MethodPut:
-		id := strings.TrimPrefix(rest, "proxies/")
-		var p model.Proxy
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-			fail(w, http.StatusBadRequest, "bad request")
-			return true
-		}
-		p.ID = id
-		if err := s.Store.UpsertProxy(p); err != nil {
-			fail(w, http.StatusInternalServerError, "could not save proxy")
-			return true
-		}
-		if p.Enabled {
-			gateway.SetProxyURL(p.ID, gateway.NormalizeProxyURL(p.Type, p.URL))
-		} else {
-			gateway.ClearProxyURL(p.ID)
-		}
-		jsonOut(w, p)
-		return true
-	case strings.HasPrefix(rest, "proxies/") && r.Method == http.MethodDelete:
-		pid := strings.TrimPrefix(rest, "proxies/")
-		if err := s.Store.DeleteProxy(pid); err != nil {
-			fail(w, http.StatusNotFound, "proxy not found")
-			return true
-		}
-		gateway.ClearProxyURL(pid)
-		w.WriteHeader(http.StatusNoContent)
 		return true
 
 	// --- channels CRUD ---
@@ -330,32 +351,118 @@ func (s *Server) adminExtRoutes(w http.ResponseWriter, r *http.Request, rest str
 	return false
 }
 
-func (s *Server) smokeTestAccount(acct model.Account) map[string]any {
+func (s *Server) smokeTestAccount(acct model.Account, requestedModel, requestedAuthMode string) map[string]any {
 	start := time.Now()
 	out := map[string]any{
 		"account_id": acct.ID,
 		"provider":   acct.Provider,
 		"ok":         false,
 	}
+	prov := strings.ToLower(strings.TrimSpace(acct.Provider))
+	modelName := strings.TrimSpace(requestedModel)
+	if modelName == "" {
+		modelName = smokeModelFor(acct.Provider)
+	}
+	authMode := strings.ToLower(strings.TrimSpace(requestedAuthMode))
+	if authMode == "" {
+		authMode = "auto"
+	}
+	out["model"] = modelName
+
+	// Claude: prefer cookie-based claude.ai path when this account has a cookie.
+	// Isolation: only this account's cookie / token — never another account's.
+	if prov == "claude" {
+		hasCookie := s.Store.HasAccountCookie(acct.ID) || gateway.HasAccountCookie(acct.ID)
+		hasOAuth := gateway.HasAccountAccessToken(acct.ID)
+		if authMode != "auto" && authMode != "cookie" && authMode != "oauth" {
+			out["path"] = "none"
+			out["error"] = "invalid auth_mode; expected auto, cookie, or oauth"
+			return out
+		}
+		if authMode == "cookie" && !hasCookie {
+			out["path"] = "cookie"
+			out["error"] = "account has no cookie / 账号未配置 Cookie"
+			return out
+		}
+		if authMode == "oauth" && !hasOAuth {
+			out["path"] = "oauth"
+			out["error"] = "account has no access_token / 账号未配置 OAuth access_token"
+			return out
+		}
+		if hasCookie && authMode != "oauth" {
+			cookie := gateway.AccountCookie(acct.ID)
+			if cookie == "" {
+				if c, err := s.Store.GetAccountCookie(acct.ID); err == nil {
+					cookie = c
+					// Hydrate cache ExtraJSON for subsequent calls without logging secrets.
+					if cred, gerr := s.Store.GetCredential(acct.ID); gerr == nil {
+						gateway.SetAccountCredential(acct.ID, cred.AccessToken, cred.RefreshToken, cred.ExtraJSON, cred.ExpiresAt)
+					}
+				}
+			}
+			res := gateway.ClaudeCookieSmokeTest(acct, cookie, modelName)
+			out["path"] = "cookie"
+			out["latency_ms"] = res.LatencyMS
+			out["ok"] = res.OK
+			out["http_status"] = res.HTTPStatus
+			if res.OrgUUID != "" {
+				out["org_uuid"] = res.OrgUUID
+			}
+			if res.MessageZH != "" {
+				out["message_zh"] = res.MessageZH
+			}
+			if res.MessageEN != "" {
+				out["message_en"] = res.MessageEN
+			}
+			if res.ResetsAt != "" {
+				out["resets_at"] = res.ResetsAt
+			}
+			if !res.OK {
+				out["error"] = res.Error
+			}
+			return out
+		}
+		if !hasOAuth {
+			out["latency_ms"] = time.Since(start).Milliseconds()
+			out["path"] = "none"
+			out["error"] = "account has no cookie or access_token / 账号未配置 Cookie 或 access_token"
+			out["message_zh"] = "账号未配置 Cookie 或 access_token"
+			out["message_en"] = "account has no cookie or access_token"
+			return out
+		}
+		out["path"] = "oauth"
+	} else if prov == "codex" || prov == "antigravity" {
+		if !gateway.HasAccountAccessToken(acct.ID) {
+			out["latency_ms"] = time.Since(start).Milliseconds()
+			out["error"] = "account has no credentials / 账号未配置凭证"
+			return out
+		}
+	}
+
 	req := gateway.ChatRequest{
-		Model:  smokeModelFor(acct.Provider),
+		Model:  modelName,
 		Stream: false,
 		Messages: []struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
 		}{{Role: "user", Content: "ping"}},
 	}
-	// For mock, hit local demo. For real providers, CallUpstream does a real probe.
 	_, err := gateway.CallUpstream(acct, req)
 	out["latency_ms"] = time.Since(start).Milliseconds()
 	if err != nil {
-		// Never echo raw upstream bodies that might contain secrets; RelayError
-		// paths already redact, but keep the message short.
-		msg := err.Error()
-		if len(msg) > 240 {
-			msg = msg[:240] + "â€¦"
+		info := gateway.MapUpstreamError(err)
+		out["error"] = info.Message
+		out["message_zh"] = info.MessageZH
+		out["message_en"] = info.MessageEN
+		if info.ResetsAt != "" {
+			out["resets_at"] = info.ResetsAt
 		}
-		out["error"] = msg
+		if info.HTTPStatus != 0 {
+			out["http_status"] = info.HTTPStatus
+		}
+		if info.Kind != "" {
+			out["kind"] = string(info.Kind)
+		}
 		return out
 	}
 	out["ok"] = true
@@ -376,7 +483,6 @@ func smokeModelFor(provider string) string {
 		return "gpt-4o-mini"
 	}
 }
-
 
 func (s *Server) adminListChannels(w http.ResponseWriter, r *http.Request) {
 	stored := s.Store.ListChannels()
@@ -406,7 +512,6 @@ func (s *Server) adminListChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonOut(w, out)
 }
-
 
 // applyRuntimeCredentialPresence ORs DB-derived PublicAccount token flags with
 // gateway runtime / env / cache knowledge so bootstrap-loaded tokens show up in

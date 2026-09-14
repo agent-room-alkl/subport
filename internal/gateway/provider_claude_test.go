@@ -30,8 +30,10 @@ func TestClaudeAdapterSendsAnthropicMessages(t *testing.T) {
 	}))
 	defer stub.Close()
 
-	t.Setenv("SUBPORT_PROVIDER_KEY_CLAUDE", "oauth-access-token-test")
-	claudeSetRuntime("", "", 0) // clear in-memory so env wins
+	claudeSetRuntime("", "", 0)
+	ClearAccountCredential("acct-claude-1")
+	SetAccountCredential("acct-claude-1", "oauth-access-token-test", "", "", "")
+	defer ClearAccountCredential("acct-claude-1")
 
 	acct := model.Account{ID: "acct-claude-1", Provider: "claude", BaseURL: stub.URL}
 	req := ChatRequest{Model: "claude-sonnet-4-20250514"}

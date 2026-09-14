@@ -184,9 +184,10 @@ func codexCredential() string {
 }
 
 func codexCredentialFor(accountID string) string {
-	// DB/cache -> runtime -> env/files.
-	if v := accountAccessToken(accountID); v != "" {
-		return v
+	// Per-account isolation: non-empty accountID uses only that account's cache.
+	accountID = trimSpace(accountID)
+	if accountID != "" {
+		return accountAccessToken(accountID)
 	}
 	return codexCredential()
 }

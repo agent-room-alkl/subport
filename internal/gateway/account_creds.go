@@ -116,55 +116,31 @@ type CredentialPresence struct {
 }
 
 // CredentialPresenceFor reports whether the gateway currently has access and/or
-// refresh tokens for accountID: account credential cache, then (for claude/codex)
-// the provider runtime / env / token files that live traffic uses (claude/codex/
-// antigravity). Secrets are never returned.
+// refresh tokens in the per-account credential cache for accountID.
+// It does NOT inherit global/runtime/env credentials from other accounts.
+// Secrets are never returned. provider is accepted for API compatibility.
 func CredentialPresenceFor(accountID, provider string) CredentialPresence {
 	var p CredentialPresence
+	_ = provider
 	accountID = trimSpace(accountID)
-	if accountID != "" {
-		accountCredMu.RLock()
-		pair, ok := accountCreds[accountID]
-		accountCredMu.RUnlock()
-		if ok {
-			p.HasAccessToken = trimSpace(pair.AccessToken) != ""
-			p.HasRefreshToken = trimSpace(pair.RefreshToken) != ""
-			p.ExpiresAt = pair.ExpiresAt
-		}
+	if accountID == "" {
+		return p
 	}
-	switch provider {
-	case "claude":
-		if !p.HasAccessToken && HasClaudeCredential() {
-			p.HasAccessToken = true
-		}
-		if !p.HasRefreshToken && trimSpace(claudeRefreshToken()) != "" {
-			p.HasRefreshToken = true
-		}
-		if trimSpace(p.ExpiresAt) == "" {
-			p.ExpiresAt = claudeRuntimeExpiresRFC3339()
-		}
-	case "codex":
-		if !p.HasAccessToken && HasCodexCredential() {
-			p.HasAccessToken = true
-		}
-		if !p.HasRefreshToken && trimSpace(codexRefreshToken()) != "" {
-			p.HasRefreshToken = true
-		}
-		if trimSpace(p.ExpiresAt) == "" {
-			p.ExpiresAt = codexRuntimeExpiresRFC3339()
-		}
-	case "antigravity":
-		if !p.HasAccessToken && HasAntigravityCredential() {
-			p.HasAccessToken = true
-		}
-		if !p.HasRefreshToken && trimSpace(antigravityRefreshToken()) != "" {
-			p.HasRefreshToken = true
-		}
-		if trimSpace(p.ExpiresAt) == "" {
-			p.ExpiresAt = antigravityRuntimeExpiresRFC3339()
-		}
+	accountCredMu.RLock()
+	pair, ok := accountCreds[accountID]
+	accountCredMu.RUnlock()
+	if ok {
+		p.HasAccessToken = trimSpace(pair.AccessToken) != ""
+		p.HasRefreshToken = trimSpace(pair.RefreshToken) != ""
+		p.ExpiresAt = pair.ExpiresAt
 	}
 	return p
+}
+
+// HasAccountAccessToken reports whether the account credential cache has a
+// non-empty access token for accountID (no global/runtime fallback).
+func HasAccountAccessToken(accountID string) bool {
+	return trimSpace(accountAccessToken(trimSpace(accountID))) != ""
 }
 
 // HydrateRuntimeFromAccount copies a cached account credential into the
@@ -253,4 +229,3 @@ func RuntimeCredentialMaterial(provider string) (access, refresh, extra, expires
 	}
 	return access, refresh, extra, expiresAt, true
 }
-

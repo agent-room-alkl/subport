@@ -96,6 +96,96 @@ func (s *Server) adminRechargeRoutes(w http.ResponseWriter, r *http.Request, res
 		jsonOut(w, out)
 		return true
 
+	case rest == "users" && r.Method == http.MethodPost:
+		var in struct {
+			Username   string `json:"username"`
+			Password   string `json:"password"`
+			Role       string `json:"role"`
+			QuotaTotal *int64 `json:"quota_total"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(w, http.StatusBadRequest, "bad request")
+			return true
+		}
+		if strings.TrimSpace(in.Username) == "" || in.Password == "" {
+			fail(w, http.StatusBadRequest, "username and password required")
+			return true
+		}
+		role := in.Role
+		if role == "" {
+			role = model.RoleUser
+		}
+		if role != model.RoleAdmin && role != model.RoleUser {
+			fail(w, http.StatusBadRequest, "role must be admin or user")
+			return true
+		}
+		u, err := s.Store.CreateUser(in.Username, in.Password, role)
+		if err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return true
+		}
+		if in.QuotaTotal != nil {
+			if err := s.Store.SetQuotaTotal(u.ID, *in.QuotaTotal); err != nil {
+				fail(w, http.StatusInternalServerError, "could not set quota")
+				return true
+			}
+			u, _ = s.Store.UserByID(u.ID)
+		}
+		jsonOut(w, model.PublicUser(u))
+		return true
+
+	case strings.HasPrefix(rest, "users/") && r.Method == http.MethodPatch:
+		id := strings.TrimPrefix(rest, "users/")
+		if strings.Contains(id, "/") {
+			return false
+		}
+		var in struct {
+			Role       *string `json:"role"`
+			QuotaTotal *int64  `json:"quota_total"`
+			Note       *string `json:"note"` // accepted but not persisted (no note column)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(w, http.StatusBadRequest, "bad request")
+			return true
+		}
+		u, err := s.Store.UserByID(id)
+		if err != nil {
+			fail(w, http.StatusNotFound, "user not found")
+			return true
+		}
+		me := s.current(r)
+		if in.Role != nil {
+			role := *in.Role
+			if role != model.RoleAdmin && role != model.RoleUser {
+				fail(w, http.StatusBadRequest, "role must be admin or user")
+				return true
+			}
+			// Block removing own admin role (self-lockout).
+			if me.ok && me.ID == id && u.Role == model.RoleAdmin && role != model.RoleAdmin {
+				fail(w, http.StatusBadRequest, "cannot demote your own admin role")
+				return true
+			}
+			// Block demoting the last admin.
+			if u.Role == model.RoleAdmin && role != model.RoleAdmin && s.Store.CountAdmins() <= 1 {
+				fail(w, http.StatusBadRequest, "cannot demote the last admin")
+				return true
+			}
+			if err := s.Store.SetRole(id, role); err != nil {
+				fail(w, http.StatusInternalServerError, "could not set role")
+				return true
+			}
+		}
+		if in.QuotaTotal != nil {
+			if err := s.Store.SetQuotaTotal(id, *in.QuotaTotal); err != nil {
+				fail(w, http.StatusInternalServerError, "could not set quota")
+				return true
+			}
+		}
+		_ = in.Note // intentionally ignored: users table has no note/enabled column
+		u, _ = s.Store.UserByID(id)
+		jsonOut(w, model.PublicUser(u))
+		return true
+
 	case strings.HasPrefix(rest, "users/") && strings.HasSuffix(rest, "/topups") && r.Method == http.MethodPost:
 		id := strings.TrimSuffix(strings.TrimPrefix(rest, "users/"), "/topups")
 		id = strings.TrimSuffix(id, "/")
@@ -123,9 +213,9 @@ func (s *Server) adminRechargeRoutes(w http.ResponseWriter, r *http.Request, res
 		}
 		u, _ := s.Store.UserByID(id)
 		jsonOut(w, map[string]any{
-			"topup":  top,
-			"order":  order,
-			"user":   model.PublicUser(u),
+			"topup": top,
+			"order": order,
+			"user":  model.PublicUser(u),
 		})
 		return true
 
@@ -166,9 +256,9 @@ func (s *Server) consoleRechargeRoutes(w http.ResponseWriter, r *http.Request, r
 	case rest == "packages" && r.Method == http.MethodGet:
 		cfg := payment.LoadConfig()
 		jsonOut(w, map[string]any{
-			"packages":          store.LoadRechargePackages(),
-			"alipay_enabled":    cfg.Enabled || cfg.Mock,
-			"alipay_mock":       cfg.Mock,
+			"packages":           store.LoadRechargePackages(),
+			"alipay_enabled":     cfg.Enabled || cfg.Mock,
+			"alipay_mock":        cfg.Mock,
 			"mock_pay_available": cfg.Mock,
 		})
 		return true

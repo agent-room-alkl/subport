@@ -20,7 +20,7 @@ import (
 const DefaultRatio = model.RatioScale
 
 func (s *Store) sqliteSetModelPrice(p model.ModelPrice) error {
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`INSERT INTO model_prices(model,rate_input,rate_output,rate_cache_read,rate_cache_write)
 		 VALUES(?,?,?,?,?)
 		 ON CONFLICT(model) DO UPDATE SET rate_input=excluded.rate_input, rate_output=excluded.rate_output,
@@ -32,7 +32,7 @@ func (s *Store) sqliteSetModelPrice(p model.ModelPrice) error {
 
 func (s *Store) sqliteModelPrice(name string) (model.ModelPrice, error) {
 	var p model.ModelPrice
-	err := s.db.QueryRow(
+	err := s.queryRow(
 		`SELECT model,rate_input,rate_output,rate_cache_read,rate_cache_write FROM model_prices WHERE model=?`,
 		name,
 	).Scan(&p.Model, &p.Input, &p.Output, &p.CacheRead, &p.CacheWrite)
@@ -43,7 +43,7 @@ func (s *Store) sqliteModelPrice(name string) (model.ModelPrice, error) {
 }
 
 func (s *Store) sqliteModelPrices() ([]model.ModelPrice, error) {
-	rows, err := s.db.Query(`SELECT model,rate_input,rate_output,rate_cache_read,rate_cache_write FROM model_prices ORDER BY model`)
+	rows, err := s.query(`SELECT model,rate_input,rate_output,rate_cache_read,rate_cache_write FROM model_prices ORDER BY model`)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +60,7 @@ func (s *Store) sqliteModelPrices() ([]model.ModelPrice, error) {
 }
 
 func (s *Store) sqliteSetGroupRatio(name string, ratio int64) error {
-	_, err := s.db.Exec(
+	_, err := s.exec(
 		`INSERT INTO billing_groups(name,ratio) VALUES(?,?)
 		 ON CONFLICT(name) DO UPDATE SET ratio=excluded.ratio`,
 		name, ratio,
@@ -70,7 +70,7 @@ func (s *Store) sqliteSetGroupRatio(name string, ratio int64) error {
 
 func (s *Store) sqliteGroupRatio(name string) (int64, error) {
 	var ratio int64
-	err := s.db.QueryRow(`SELECT ratio FROM billing_groups WHERE name=?`, name).Scan(&ratio)
+	err := s.queryRow(`SELECT ratio FROM billing_groups WHERE name=?`, name).Scan(&ratio)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, ErrNotFound
 	}
@@ -78,7 +78,7 @@ func (s *Store) sqliteGroupRatio(name string) (int64, error) {
 }
 
 func (s *Store) sqliteSetUserBilling(userID, group string, override int64) error {
-	res, err := s.db.Exec(
+	res, err := s.exec(
 		`UPDATE users SET billing_group=?, ratio_override=? WHERE id=?`,
 		group, override, userID,
 	)
@@ -92,7 +92,7 @@ func (s *Store) sqliteSetUserBilling(userID, group string, override int64) error
 }
 
 func (s *Store) sqliteUserBilling(userID string) (group string, override int64, err error) {
-	err = s.db.QueryRow(`SELECT billing_group, ratio_override FROM users WHERE id=?`, userID).Scan(&group, &override)
+	err = s.queryRow(`SELECT billing_group, ratio_override FROM users WHERE id=?`, userID).Scan(&group, &override)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, ErrNotFound
 	}

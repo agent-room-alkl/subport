@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, pr
 CREATE TABLE IF NOT EXISTS model_prices (model TEXT PRIMARY KEY, rate_input INTEGER NOT NULL, rate_output INTEGER NOT NULL, rate_cache_read INTEGER NOT NULL, rate_cache_write INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS billing_groups (name TEXT PRIMARY KEY, ratio INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS account_credentials (account_id TEXT PRIMARY KEY, access_token TEXT NOT NULL DEFAULT '', refresh_token TEXT NOT NULL DEFAULT '', extra_json TEXT NOT NULL DEFAULT '', expires_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS proxies (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'http', url TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT 'default', priority INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1, models_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS channel_accounts (channel_id TEXT NOT NULL, account_id TEXT NOT NULL, model_pattern TEXT NOT NULL DEFAULT '', priority INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(channel_id, account_id));
 CREATE TABLE IF NOT EXISTS model_routes (id TEXT PRIMARY KEY, pattern TEXT NOT NULL, provider TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1);
@@ -83,11 +82,6 @@ func openSQLite(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if err = softAddColumn(db, `ALTER TABLE accounts ADD COLUMN proxy_id TEXT NOT NULL DEFAULT ''`); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-
 	if err = softAddColumn(db, `ALTER TABLE accounts ADD COLUMN consecutive_429 INTEGER NOT NULL DEFAULT 0`); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -116,6 +110,19 @@ func openSQLite(path string) (*sql.DB, error) {
 	}
 
 	if err = seedDefaultModelRoutes(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	if err = ensureAvailableModelsTable(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = ensureAppSettingsTable(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = seedAvailableModels(db, false); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

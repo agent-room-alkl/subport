@@ -1,4 +1,4 @@
-// Package store is Subport's persistence layer, backed by SQLite.
+// Package store is Subport's persistence layer (SQLite or Postgres).
 //
 // There is exactly one storage path. An earlier revision wrote both a JSON
 // snapshot and SQLite on every mutation; that left two sources of truth which
@@ -39,8 +39,9 @@ type legacyData struct {
 }
 
 type Store struct {
-	mu sync.Mutex // serialises multi-statement work; SQLite handles the rest
-	db *sql.DB
+	mu     sync.Mutex // serialises multi-statement work; SQLite handles the rest
+	db     *sql.DB
+	driver string
 }
 
 // seedAccounts is the starting pool for a fresh store. Two accounts share
@@ -64,14 +65,27 @@ func seedAccounts(base string) []model.Account {
 	}
 }
 
-// OpenStore opens the SQLite database beside path. If path names a legacy JSON
-// snapshot and the database is still empty, its contents are imported once.
+// OpenStore opens Postgres when DATABASE_URL or PGHOST is set; otherwise SQLite
+// beside path. A legacy JSON snapshot is imported once if the SQLite DB is empty.
 func OpenStore(path, seedBaseURL string) (*Store, error) {
+	if envWantsPostgres() {
+		db, err := openPostgres()
+		if err != nil {
+			return nil, err
+		}
+		s := &Store{db: db, driver: driverPostgres}
+		if err := s.sqliteEnsureAccounts(seedAccounts(seedBaseURL)); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		return s, nil
+	}
+
 	db, err := openSQLite(path + ".sqlite")
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, driver: driverSQLite}
 
 	if err := s.importLegacyJSON(path); err != nil {
 		_ = db.Close()
@@ -88,7 +102,7 @@ func OpenStore(path, seedBaseURL string) (*Store, error) {
 // the database already holds users, so the JSON file is never a live mirror.
 func (s *Store) importLegacyJSON(path string) error {
 	var users int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
+	if err := s.queryRow(`SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
 		return err
 	}
 	if users > 0 {
@@ -384,7 +398,7 @@ func (s *Store) ReserveQuota(userID string, amount int64) error {
 func (s *Store) SetQuotaTotal(userID string, total int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`UPDATE users SET quota_total = ? WHERE id=?`, total, userID)
+	res, err := s.exec(`UPDATE users SET quota_total = ? WHERE id=?`, total, userID)
 	if err != nil {
 		return err
 	}
@@ -446,6 +460,16 @@ func (s *Store) UpsertAccount(a model.Account) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sqliteUpsertAccount(a)
+}
+
+// DeleteAccount removes an upstream account row, its credentials, and any
+// channel_accounts mappings. Scheduler sync is the caller's responsibility.
+func (s *Store) DeleteAccount(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.sqliteDeleteCredential(id) // ignore missing credentials
+	_, _ = s.exec(`DELETE FROM channel_accounts WHERE account_id=?`, id)
+	return s.sqliteDeleteAccount(id)
 }
 
 // ---------------------------------------------------------------- compensation

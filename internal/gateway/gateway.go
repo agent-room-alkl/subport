@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -100,30 +101,28 @@ func (s *Scheduler) SetAccountHealth(id string, healthy bool) {
 // attempt 0 and 1 are peers in tier 1 before attempt 2 reaches tier 2.
 //
 // When modelName matches enabled model_routes, only eligible providers (plus
-// mock) are considered so the walk never burns attempts on the wrong upstream.
+// mock) are considered. A matched route fails closed when all of its accounts
+// are unavailable; sending the model to a different provider cannot succeed
+// and risks crossing account and credential boundaries.
 func (s *Scheduler) Pick(attempt int, modelName string) (model.Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	now := time.Now().UTC()
 	tiers := map[int][]model.Account{}
+	var cooling []model.Account
 	for _, a := range s.accounts {
-		if !accountSchedulable(a, now) {
-			continue
-		}
 		if !AccountEligibleForModel(s.routes, a.Provider, modelName) {
 			continue
 		}
-		tiers[a.Priority] = append(tiers[a.Priority], a)
-	}
-	// If routing filtered everyone out (e.g. only mock paused and no matching
-	// provider), fall back to unfiltered schedulable accounts so the pool is not
-	// silently empty.
-	if len(tiers) == 0 {
-		for _, a := range s.accounts {
-			if accountSchedulable(a, now) {
-				tiers[a.Priority] = append(tiers[a.Priority], a)
-			}
+		if accountSchedulable(a, now) {
+			tiers[a.Priority] = append(tiers[a.Priority], a)
+			continue
+		}
+		// Eligible but cooling / temporarily unhealthy — candidate for
+		// "soonest expiry" fallback when the live pool is empty.
+		if a.Healthy || strings.TrimSpace(a.CooldownUntil) != "" {
+			cooling = append(cooling, a)
 		}
 	}
 	priorities := make([]int, 0, len(tiers))
@@ -141,7 +140,36 @@ func (s *Scheduler) Pick(attempt int, modelName string) (model.Account, bool) {
 			seen++
 		}
 	}
-	return model.Account{}, false
+	if seen > 0 {
+		// Live pool existed but attempt walked past it.
+		return model.Account{}, false
+	}
+	// All eligible accounts are cooling: pick soonest CooldownUntil.
+	if len(cooling) == 0 {
+		return model.Account{}, false
+	}
+	sort.SliceStable(cooling, func(i, j int) bool {
+		return cooldownExpiry(cooling[i]).Before(cooldownExpiry(cooling[j]))
+	})
+	if attempt < 0 || attempt >= len(cooling) {
+		return model.Account{}, false
+	}
+	return cooling[attempt], true
+}
+
+func cooldownExpiry(a model.Account) time.Time {
+	cu := strings.TrimSpace(a.CooldownUntil)
+	if cu == "" {
+		return time.Unix(1<<62, 0) // far future for missing values
+	}
+	t, err := time.Parse(time.RFC3339, cu)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339Nano, cu)
+	}
+	if err != nil {
+		return time.Unix(1<<62, 0)
+	}
+	return t
 }
 
 // CallUpstream dispatches to the adapter named by the account's Provider.
@@ -170,45 +198,60 @@ type Result struct {
 // failure aborts immediately and is never replayed.
 func (s *Scheduler) Relay(req ChatRequest) (Result, error) {
 	var lastErr error
+	models := ModelAttemptChain(req.Model)
+	totalAttempts := 0
 
-	for attempt := 0; attempt < MaxAttempts; attempt++ {
-		acct, ok := s.Pick(attempt, req.Model)
-		if !ok {
+	for mi, modelName := range models {
+		try := req
+		try.Model = modelName
+		for attempt := 0; attempt < MaxAttempts; attempt++ {
+			acct, ok := s.Pick(attempt, try.Model)
+			if !ok {
+				continue
+			}
+			totalAttempts++
+
+			reply, err := CallUpstream(acct, try)
+			status := "200"
+			if err != nil {
+				status = "failed"
+			}
+			if err != nil {
+				log.Printf("attempt=%d model=%s account=%s provider=%s -> %s err=%v", attempt, try.Model, acct.ID, acct.Provider, status, err)
+			} else {
+				log.Printf("attempt=%d model=%s account=%s provider=%s -> %s", attempt, try.Model, acct.ID, acct.Provider, status)
+			}
+
+			s.NoteUpstreamResult(acct.ID, err)
+
+			if err == nil {
+				return Result{
+					Account:  acct,
+					Text:     reply.Content,
+					Tokens:   reply.Tokens,
+					Attempts: totalAttempts,
+				}, nil
+			}
+			lastErr = err
+
+			var relayErr RelayError
+			if errors.As(err, &relayErr) && relayErr.FirstByteSent {
+				return Result{Account: acct, Attempts: totalAttempts}, err
+			}
+		}
+		// After exhausting the account pool for this model, try next fallback
+		// only on 429/5xx-style failures.
+		if mi+1 < len(models) && lastErr != nil && IsRetryableUpstreamStatus(lastErr) {
+			log.Printf("model-fallback: from=%s to=%s reason=%v", modelName, models[mi+1], lastErr)
 			continue
 		}
-
-		reply, err := CallUpstream(acct, req)
-		status := "200"
-		if err != nil {
-			status = "failed"
-		}
-		if err != nil {
-			log.Printf("attempt=%d account=%s provider=%s -> %s err=%v", attempt, acct.ID, acct.Provider, status, err)
-		} else {
-			log.Printf("attempt=%d account=%s provider=%s -> %s", attempt, acct.ID, acct.Provider, status)
-		}
-
-		s.NoteUpstreamResult(acct.ID, err)
-
-		if err == nil {
-			return Result{
-				Account:  acct,
-				Text:     reply.Content,
-				Tokens:   reply.Tokens,
-				Attempts: attempt + 1,
-			}, nil
-		}
-		lastErr = err
-
-		var relayErr RelayError
-		if errors.As(err, &relayErr) && relayErr.FirstByteSent {
-			return Result{Account: acct, Attempts: attempt + 1}, err
-		}
+		break
 	}
 
 	if lastErr == nil {
 		lastErr = errors.New("no healthy account")
 	}
+	// Surface bilingual quota messaging when the last error is a known class.
 	return Result{}, lastErr
 }
 
